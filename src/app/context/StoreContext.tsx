@@ -20,6 +20,35 @@ import {
   getSettings as loadSettings,
 } from "../services/databaseService";
 import { syncAll } from "../sync/syncService";
+import { generateRestockSuggestions, RestockSuggestion } from "../ai/restockEngine";
+import {
+  computeProductProfitability,
+  topProfitable,
+  leastProfitable,
+  ProfitabilityRow,
+} from "../analytics/profitabilityEngine";
+import {
+  groupSalesByHour,
+  aggregateDailySales,
+  aggregateWeeklyTrends,
+  HourlySalesBucket,
+  DailySalesPoint,
+  WeeklyTrendPoint,
+} from "../analytics/hourlySales";
+import { computeCommunityProductStats, CommunityProductStats } from "../analytics/communityAnalytics";
+import { buildBenchmark, StorePerformance } from "../analytics/benchmarkEngine";
+import {
+  Supplier,
+  SupplierProduct,
+  RestockOrder,
+  RestockOrderItem,
+  RestockOrderStatus,
+  buildSuggestedSuppliers,
+  createRestockOrder,
+  updateRestockOrderStatus as applyRestockOrderStatus,
+  formatRestockMessage,
+} from "../marketplace/marketplaceService";
+import { ChatMessage, sendMessage as sendChatMessage, getConversation, getAllMessages } from "../marketplace/chatService";
 
 export type Unit = "piece" | "pack" | "box" | "kg" | "grams" | "ml" | "liters";
 type BaseUnit = "piece" | "grams" | "ml";
@@ -727,6 +756,9 @@ interface StoreContextType {
   pabiliOrders: PabiliOrder[];
   expenses: Expense[];
   restockList: RestockItem[];
+  suppliers: Supplier[];
+  restockOrders: RestockOrder[];
+  chatMessages: ChatMessage[];
   settings: StoreSettings;
   t: typeof translations["en"];
   // Mode
@@ -766,21 +798,24 @@ interface StoreContextType {
   // Restock
   updateRestockList: (items: RestockItem[]) => void;
   checkRestockItem: (productId: string, checked: boolean, purchasedQty: number) => void;
+  // Marketplace
+  placeRestockOrder: (supplierId: string, items: RestockOrderItem[]) => RestockOrder | null;
+  updateRestockOrderStatus: (orderId: string, status: RestockOrderStatus) => void;
+  getSupplierCatalog: () => SupplierProduct[];
+  sendChat: (input: Omit<ChatMessage, "id" | "timestamp"> & { id?: string; timestamp?: string }) => ChatMessage;
+  getConversation: (a: string, b: string) => ChatMessage[];
   // Expenses
   addExpense: (e: Omit<Expense, "id">) => void;
   // Analytics
   getWeeklyRevenue: () => number;
   getWeeklyProfit: () => number;
-  getHourlySales: (date?: Date) => { hour: number; total: number }[];
-  getDailySales: (days?: number) => { date: string; total: number }[];
+  getHourlySales: (date?: Date) => HourlySalesBucket[];
+  getDailySales: (days?: number) => DailySalesPoint[];
+  getWeeklyTrends: (weeks?: number) => WeeklyTrendPoint[];
   getTopSellingProducts: (limit?: number) => Array<{ name: string; qty: number; revenue: number; profit: number; emoji: string }>;
-  getProductProfitability: (limit?: number) => Array<{ name: string; profit: number; revenue: number; cost: number; emoji: string; margin: number }>;
-  getSmartRestockSuggestions: () => Array<{
-    product: Product;
-    avgDailySales: number;
-    suggestedQty: number;
-    estimatedCost: number;
-  }>;
+  getProductProfitability: (limit?: number) => ProfitabilityRow[];
+  getLeastProfitable: (limit?: number) => ProfitabilityRow[];
+  getSmartRestockSuggestions: () => RestockSuggestion[];
   getProductAnalytics: (period: "today" | "week" | "all") => Array<{
     name: string;
     emoji: string;
@@ -788,6 +823,8 @@ interface StoreContextType {
     revenue: number;
     avgDaily: number;
   }>;
+  getCommunityInsights: () => CommunityProductStats[];
+  getBenchmarkSnapshot: () => StorePerformance[];
   // Settings
   updateSettings: (s: Partial<StoreSettings>) => void;
   cartTotal: number;
@@ -978,6 +1015,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [pabiliOrders, setPabiliOrders] = useState<PabiliOrder[]>(initialPabiliOrders);
   const [expenses, setExpenses] = useState<Expense[]>(initialExpenses);
   const [restockList, setRestockList] = useState<RestockItem[]>([]);
+  const [suppliers, setSuppliers] = useState<Supplier[]>([]);
+  const [restockOrders, setRestockOrders] = useState<RestockOrder[]>([]);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [settings, setSettings] = useState<StoreSettings>(initialSettings);
   // Mode state (session only)
   const [isManagementMode, setIsManagementMode] = useState(false);
@@ -985,6 +1025,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const t = translations[settings.language];
   const cartTotal = cart.reduce((sum, item) => sum + item.subtotal, 0);
+  const communityStats = useMemo(() => computeCommunityProductStats({ sales, products }), [sales, products]);
 
   const seedInitialData = useCallback(async () => {
     await Promise.all(initialProducts.map(p => persistProduct(p)));
@@ -1050,12 +1091,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         await seedInitialData();
       }
       if (!active) return;
+      const baseProducts = dbProducts.length ? dbProducts : initialProducts;
       setSettings(savedSettings || initialSettings);
-      setProducts(dbProducts.length ? dbProducts : initialProducts);
+      setProducts(baseProducts);
       setCustomers(dbCustomers.length ? dbCustomers : initialCustomers);
       setSales(dbSales.length ? dbSales : initialSales);
       setPabiliOrders(dbPabili.length ? dbPabili : initialPabiliOrders);
       setExpenses(dbExpenses.length ? dbExpenses : initialExpenses);
+      setSuppliers(buildSuggestedSuppliers(baseProducts));
       await syncAll().catch(err => console.debug("Initial sync skipped", err));
     };
     hydrate();
@@ -1074,6 +1117,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       void persistSettings(next);
       return next;
     });
+  }, []);
+
+  useEffect(() => {
+    setSuppliers(buildSuggestedSuppliers(products));
+  }, [products]);
+
+  useEffect(() => {
+    setChatMessages(getAllMessages());
   }, []);
 
   // Mode management
@@ -1451,6 +1502,42 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, [products]);
 
+  // Marketplace & Chat
+  const getSupplierCatalog = useCallback(() => suppliers.flatMap(s => s.products), [suppliers]);
+
+  const placeRestockOrder = useCallback((supplierId: string, items: RestockOrderItem[]) => {
+    const order = createRestockOrder({ supplierId, items, suppliers });
+    if (!order) return null;
+    setRestockOrders(prev => [order, ...prev]);
+    const supplier = suppliers.find(s => s.id === supplierId);
+    if (supplier) {
+      const msgText = formatRestockMessage(order, supplier);
+      const chat = sendChatMessage({
+        senderId: "store-owner",
+        receiverId: supplierId,
+        message: msgText,
+        context: "restock",
+        threadId: order.id,
+      });
+      setChatMessages(prev => [chat, ...prev]);
+    }
+    return order;
+  }, [suppliers]);
+
+  const updateRestockOrderStatus = useCallback((orderId: string, status: RestockOrderStatus) => {
+    setRestockOrders(prev => prev.map(o => o.id === orderId ? applyRestockOrderStatus(o, status) : o));
+  }, []);
+
+  const sendChat = useCallback((input: Omit<ChatMessage, "id" | "timestamp"> & { id?: string; timestamp?: string }) => {
+    const msg = sendChatMessage(input);
+    setChatMessages(prev => [msg, ...prev]);
+    return msg;
+  }, []);
+
+  const getConversationMessages = useCallback((a: string, b: string) => {
+    return getConversation(a, b);
+  }, []);
+
   // Expenses
   const addExpense = useCallback((e: Omit<Expense, "id">) => {
     const id = crypto.randomUUID ? crypto.randomUUID() : `exp${Date.now()}`;
@@ -1482,31 +1569,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [sales, products, expenses]);
 
   const getSmartRestockSuggestions = useCallback(() => {
-    const productQtyMap: Record<string, number> = {};
-    sales.filter(s => new Date(s.date) >= sevenDaysAgo).forEach(s =>
-      s.items.forEach(item => {
-        const p = products.find(x => x.name === item.name || x.id === item.productId);
-        if (p) productQtyMap[p.id] = (productQtyMap[p.id] || 0) + toBaseUnits(p, item.qty);
-      })
-    );
-    return products
-      .filter(p => {
-        const avgDailyBase = (productQtyMap[p.id] || 0) / 7;
-        return avgDailyBase > 0 && p.stock < avgDailyBase * 7;
-      })
-      .map(p => {
-        const avgDailyBase = (productQtyMap[p.id] || 0) / 7;
-        const suggestedBase = Math.max(0, Math.ceil(avgDailyBase * 14 - p.stock));
-        const suggested = Math.max(1, Math.ceil(fromBaseUnits(p, suggestedBase)));
-        return {
-          product: p,
-          avgDailySales: fromBaseUnits(p, avgDailyBase),
-          suggestedQty: suggested,
-          estimatedCost: suggested * p.cost,
-        };
-      })
-      .sort((a, b) => b.avgDailySales - a.avgDailySales);
-  }, [sales, products]);
+    return generateRestockSuggestions(products, sales, { lookbackDays: 7, bufferDays: 14, thresholdDays: 3 });
+  }, [products, sales]);
 
   const getProductAnalytics = useCallback((period: "today" | "week" | "all") => {
     const cutoff = period === "today"
@@ -1538,23 +1602,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [sales, products]);
 
   const getHourlySales = useCallback((date: Date = new Date()) => {
-    const target = fmt(date);
-    return Array.from({ length: 24 }, (_, hour) => {
-      const total = sales
-        .filter(s => s.date.startsWith(target))
-        .filter(s => new Date(s.date).getHours() === hour)
-        .reduce((sum, s) => sum + s.total, 0);
-      return { hour, total };
-    });
+    return groupSalesByHour(sales, date);
   }, [sales]);
 
   const getDailySales = useCallback((days: number = 7) => {
-    return Array.from({ length: days }, (_, idx) => {
-      const d = new Date(); d.setDate(d.getDate() - (days - 1 - idx));
-      const ds = fmt(d);
-      const total = sales.filter(s => s.date.startsWith(ds)).reduce((sum, s) => sum + s.total, 0);
-      return { date: ds, total };
-    });
+    return aggregateDailySales(sales, days);
+  }, [sales]);
+
+  const getWeeklyTrends = useCallback((weeks: number = 4) => {
+    return aggregateWeeklyTrends(sales, weeks);
   }, [sales]);
 
   const getTopSellingProducts = useCallback((limit: number = 5) => {
@@ -1565,15 +1621,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [getProductAnalytics]);
 
   const getProductProfitability = useCallback((limit: number = 5) => {
-    return getProductAnalytics("all")
-      .sort((a, b) => b.profit - a.profit)
-      .slice(0, limit)
-      .map(({ name, profit, revenue, cost, emoji, margin }) => ({ name, profit, revenue, cost, emoji, margin }));
-  }, [getProductAnalytics]);
+    return topProfitable(products, sales, limit);
+  }, [products, sales]);
+
+  const getLeastProfitable = useCallback((limit: number = 5) => {
+    return leastProfitable(products, sales, limit);
+  }, [products, sales]);
+
+  const getCommunityInsights = useCallback(() => communityStats, [communityStats]);
+
+  const getBenchmarkSnapshot = useCallback(() => buildBenchmark(sales, products, { communityStats }), [sales, products, communityStats]);
 
   return (
     <StoreContext.Provider value={{
-      products, cart, customers, sales, pabiliOrders, expenses, restockList, settings, t,
+      products, cart, customers, sales, pabiliOrders, expenses, restockList, suppliers, restockOrders, chatMessages, settings, t,
       isManagementMode, operatingUser,
       enterManagementMode, exitManagementMode, completeOnboarding, setOperatingUser,
       addProduct, updateProduct, deleteProduct, addStock, searchProducts,
@@ -1581,11 +1642,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       completeSale, addUtangSale,
       addCustomer, recordPayment, getCustomerBalance,
       addPabiliOrder, updatePabiliStatus,
-      updateRestockList, checkRestockItem,
+      updateRestockList, checkRestockItem, placeRestockOrder, updateRestockOrderStatus, getSupplierCatalog,
+      sendChat, getConversation: getConversationMessages,
       addExpense,
       getWeeklyRevenue, getWeeklyProfit,
       getSmartRestockSuggestions, getProductAnalytics,
-      getHourlySales, getDailySales, getTopSellingProducts, getProductProfitability,
+      getHourlySales, getDailySales, getWeeklyTrends,
+      getTopSellingProducts, getProductProfitability, getLeastProfitable,
+      getCommunityInsights, getBenchmarkSnapshot,
       updateSettings, cartTotal,
     }}>
       {children}

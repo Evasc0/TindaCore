@@ -5,7 +5,11 @@ import { useStore, canAccess, RestockItem, Product } from "../context/StoreConte
 import { TierBadge, TierGate, UpgradeBanner } from "./TierComponents";
 
 export function SmartRestockScreen() {
-  const { settings, t, getSmartRestockSuggestions, restockList, updateRestockList, checkRestockItem, products } = useStore();
+  const {
+    settings, t, getSmartRestockSuggestions, restockList,
+    updateRestockList, checkRestockItem, products,
+    suppliers, placeRestockOrder, restockOrders,
+  } = useStore();
   const navigate = useNavigate();
   const isDark = settings.theme === "dark";
   const sub = settings.subscription;
@@ -35,8 +39,10 @@ export function SmartRestockScreen() {
   );
   const [shoppingList, setShoppingList] = useState<RestockItem[]>(restockList);
   const [tab, setTab] = useState<"suggestions" | "list">("suggestions");
+  const [lastOrderId, setLastOrderId] = useState<string | null>(null);
 
   const totalBudget = shoppingList.filter(i => !i.checked).reduce((sum, i) => sum + i.estimatedCost, 0);
+  const recentOrder = lastOrderId ? restockOrders.find(o => o.id === lastOrderId) : restockOrders[0];
 
   const addToShoppingList = (s: (typeof suggestions)[0]) => {
     const qty = editedQtys[s.product.id] || s.suggestedQty;
@@ -78,6 +84,25 @@ export function SmartRestockScreen() {
     });
     setShoppingList(updated);
     updateRestockList(updated);
+  };
+
+  const handleSendOrder = () => {
+    const supplier = suppliers[0];
+    if (!supplier || shoppingList.length === 0) return;
+    const items = shoppingList.map(item => {
+      const product = products.find(p => p.id === item.productId);
+      return {
+        productId: item.productId,
+        name: item.productName,
+        quantity: item.editedQty || item.suggestedQty,
+        unit: product?.unit || "piece",
+        price: product?.cost || 0,
+      };
+    });
+    const order = placeRestockOrder(supplier.id, items);
+    if (order) {
+      setLastOrderId(order.id);
+    }
   };
 
   const getStockBadge = (stock: number, avgDaily: number) => {
@@ -341,6 +366,32 @@ export function SmartRestockScreen() {
                 <p className="text-xs mt-1" style={{ color: textMuted }}>
                   {shoppingList.filter(i => i.checked).length}/{shoppingList.length} items purchased
                 </p>
+              </div>
+
+              {/* Supplier order */}
+              <div className="rounded-2xl border p-4 mb-4" style={{ background: card, borderColor: cardBorder }}>
+                <div className="flex items-center justify-between mb-3">
+                  <div>
+                    <p className="text-sm font-semibold" style={{ color: text }}>Send to supplier</p>
+                    <p className="text-xs" style={{ color: textMuted }}>{suppliers[0]?.storeName || "No supplier available"}</p>
+                  </div>
+                  <span className="text-xs font-bold px-2 py-1 rounded-full" style={{ background: isDark ? "#111827" : "#eef2ff", color: "#1d4ed8" }}>
+                    Premium
+                  </span>
+                </div>
+                <button
+                  onClick={handleSendOrder}
+                  disabled={!suppliers.length || shoppingList.length === 0}
+                  className="w-full py-2.5 rounded-xl text-sm font-bold transition-all disabled:opacity-60"
+                  style={{ background: "#1d4ed8", color: "#fff" }}
+                >
+                  Send restock request
+                </button>
+                {recentOrder && (
+                  <p className="text-xs mt-2" style={{ color: textMuted }}>
+                    Last order: {recentOrder.status} · {new Date(recentOrder.timestamp).toLocaleTimeString()}
+                  </p>
+                )}
               </div>
 
               {/* Export Options */}

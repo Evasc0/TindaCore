@@ -11,7 +11,9 @@ export function AnalyticsScreen() {
   const {
     sales, customers, getCustomerBalance, products, settings, t,
     getProductAnalytics, getSmartRestockSuggestions,
-    getHourlySales, getDailySales, getTopSellingProducts, getProductProfitability,
+    getHourlySales, getDailySales, getWeeklyTrends,
+    getTopSellingProducts, getProductProfitability, getLeastProfitable,
+    getCommunityInsights, getBenchmarkSnapshot,
   } = useStore();
   const isDark = settings.theme === "dark";
   const sub = settings.subscription;
@@ -38,6 +40,8 @@ export function AnalyticsScreen() {
   const now = new Date();
   const todayStr = now.toISOString().split("T")[0];
   const weekAgo = new Date(now); weekAgo.setDate(now.getDate() - 7);
+  const canAdvanced = canAccess(sub, "plus");
+  const canPremium = canAccess(sub, "premium");
 
   const filteredSales = sales.filter(s => {
     if (period === "today") return s.date.startsWith(todayStr);
@@ -62,16 +66,22 @@ export function AnalyticsScreen() {
 
   const hourlyChartData = getHourlySales().map(h => ({
     hour: `${h.hour.toString().padStart(2, "0")}:00`,
-    amount: h.total,
+    amount: (h as any).totalSales ?? (h as any).total ?? 0,
+    tx: (h as any).numberOfTransactions ?? 0,
   }));
 
+  const weeklyTrendData = getWeeklyTrends(4);
+
   const productProfitability = getProductProfitability(5);
+  const leastProfitable = getLeastProfitable(5);
 
   const productAnalytics = getProductAnalytics(period);
   const topSelling = productAnalytics.slice(0, 5);
   const fastestMoving = [...productAnalytics].sort((a, b) => b.avgDaily - a.avgDaily).slice(0, 5);
   const slowMoving = productAnalytics.filter(p => p.qty > 0).sort((a, b) => a.avgDaily - b.avgDaily).slice(0, 5);
   const predictedLowStock = getSmartRestockSuggestions().slice(0, 5);
+  const communityInsights = getCommunityInsights().slice(0, 3);
+  const benchmark = getBenchmarkSnapshot();
 
   const CustomTooltip = ({ active, payload, label }: any) => {
     if (active && payload?.length) {
@@ -90,26 +100,6 @@ export function AnalyticsScreen() {
     { key: "week", label: t.week },
     { key: "all", label: t.allTime },
   ];
-
-  if (!canAccess(sub, "plus")) {
-    return (
-      <div className="flex flex-col h-full" style={{ background: bg }}>
-        <div style={{ background: "linear-gradient(160deg, #052e16 0%, #065f46 60%, #059669 100%)" }} className="px-4 pt-4 pb-5 flex-shrink-0">
-          <div className="flex items-center justify-between mb-3">
-            <div>
-              <h2 className="text-white font-bold" style={{ fontSize: "20px" }}>{t.analytics}</h2>
-              <p className="text-green-300 text-xs mt-0.5">{t.last7Days}</p>
-            </div>
-            <TierBadge tier={sub} size="sm" />
-          </div>
-        </div>
-        <div className="flex-1 p-4 space-y-4">
-          <UpgradeBanner from={sub} to="plus" />
-          <TierGate required="plus" featureName={t.analytics} />
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div className="flex flex-col h-full" style={{ background: bg }}>
@@ -180,16 +170,50 @@ export function AnalyticsScreen() {
         </div>
 
         {/* Hourly sales */}
-        <div className="rounded-2xl border p-4 mb-4" style={{ background: card, borderColor: cardBorder }}>
-          <SectionHeader title={t.earningsPerHour} />
-          <ResponsiveContainer width="100%" height={140}>
-            <BarChart data={hourlyChartData} margin={{ top: 5, right: 0, bottom: 0, left: 0 }}>
-              <XAxis dataKey="hour" tick={{ fontSize: 9, fill: textMuted }} axisLine={false} tickLine={false} />
-              <Tooltip content={<CustomTooltip />} />
-              <Bar dataKey="amount" fill="#2563eb" radius={[4, 4, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
+        {canAdvanced ? (
+          <div className="rounded-2xl border p-4 mb-4" style={{ background: card, borderColor: cardBorder }}>
+            <SectionHeader title={t.earningsPerHour} tier="plus" />
+            <ResponsiveContainer width="100%" height={140}>
+              <BarChart data={hourlyChartData} margin={{ top: 5, right: 0, bottom: 0, left: 0 }}>
+                <XAxis dataKey="hour" tick={{ fontSize: 9, fill: textMuted }} axisLine={false} tickLine={false} />
+                <Tooltip content={<CustomTooltip />} />
+                <Bar dataKey="amount" fill="#2563eb" radius={[4, 4, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+            <p className="text-[11px] mt-1" style={{ color: textMuted }}>Transactions: {hourlyChartData.reduce((s, h) => s + (h.tx || 0), 0)}</p>
+          </div>
+        ) : (
+          <div className="rounded-2xl border p-4 mb-4" style={{ background: card, borderColor: cardBorder }}>
+            <SectionHeader title={t.earningsPerHour} tier="plus" />
+            <TierGate required="plus" featureName={t.earningsPerHour} compact />
+          </div>
+        )}
+
+        {/* Weekly trends */}
+        {canAdvanced ? (
+          <div className="rounded-2xl border p-4 mb-4" style={{ background: card, borderColor: cardBorder }}>
+            <SectionHeader title="Weekly Trends" tier="plus" />
+            <ResponsiveContainer width="100%" height={140}>
+              <AreaChart data={weeklyTrendData} margin={{ top: 5, right: 0, bottom: 0, left: 0 }}>
+                <defs>
+                  <linearGradient id="weeklyGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#2563eb" stopOpacity={0.3} />
+                    <stop offset="95%" stopColor="#2563eb" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <XAxis dataKey="label" tick={{ fontSize: 9, fill: textMuted }} axisLine={false} tickLine={false} />
+                <Tooltip content={<CustomTooltip />} />
+                <Area type="monotone" dataKey="totalSales" stroke="#2563eb" strokeWidth={2.5} fill="url(#weeklyGrad)" dot={false} />
+              </AreaChart>
+            </ResponsiveContainer>
+            <p className="text-[11px] mt-1" style={{ color: textMuted }}>Avg ticket PHP{weeklyTrendData.length ? weeklyTrendData[weeklyTrendData.length - 1].averageTicket.toFixed(2) : "0.00"}</p>
+          </div>
+        ) : (
+          <div className="rounded-2xl border p-4 mb-4" style={{ background: card, borderColor: cardBorder }}>
+            <SectionHeader title="Weekly Trends" tier="plus" />
+            <TierGate required="plus" featureName="Weekly analytics" compact />
+          </div>
+        )}
 
         {/* Top Selling */}
         <div className="rounded-2xl border p-4 mb-4" style={{ background: card, borderColor: cardBorder }}>
@@ -278,26 +302,56 @@ export function AnalyticsScreen() {
         )}
 
         {/* Profitability */}
-        <div className="rounded-2xl border p-4 mb-4" style={{ background: card, borderColor: cardBorder }}>
-          <SectionHeader title="Product Profitability" />
-          {productProfitability.length === 0 ? (
-            <p className="text-sm text-center py-2" style={{ color: textMuted }}>No sales yet</p>
-          ) : (
-            productProfitability.map(item => (
-              <div key={item.name} className="flex items-center gap-3 py-2 border-b last:border-0" style={{ borderColor: cardBorder }}>
-                <span className="text-lg">{item.emoji}</span>
-                <div className="flex-1">
-                  <p className="text-sm font-medium" style={{ color: text }}>{item.name}</p>
-                  <p className="text-xs" style={{ color: textMuted }}>Margin {(item.margin * 100).toFixed(1)}%</p>
+        {canAdvanced ? (
+          <div className="rounded-2xl border p-4 mb-4" style={{ background: card, borderColor: cardBorder }}>
+            <SectionHeader title="Product Profitability" tier="plus" />
+            {productProfitability.length === 0 ? (
+              <p className="text-sm text-center py-2" style={{ color: textMuted }}>No sales yet</p>
+            ) : (
+              productProfitability.map(item => (
+                <div key={item.productName || item.name} className="flex items-center gap-3 py-2 border-b last:border-0" style={{ borderColor: cardBorder }}>
+                  <span className="text-lg">{(item as any).emoji || "📦"}</span>
+                  <div className="flex-1">
+                    <p className="text-sm font-medium" style={{ color: text }}>{item.productName || item.name}</p>
+                    <p className="text-xs" style={{ color: textMuted }}>Margin {((item.margin ?? item.profitMargin) * 100).toFixed(1)}%</p>
+                  </div>
+                  <div className="text-right">
+                    <p className="font-bold text-sm" style={{ color: (item.grossProfit ?? item.profit ?? 0) >= 0 ? "#16a34a" : "#ef4444" }}>PHP{(item.grossProfit ?? item.profit ?? 0).toFixed(2)}</p>
+                    <p className="text-[11px]" style={{ color: textMuted }}>PHP{item.totalRevenue?.toFixed?.(0) ?? item.revenue?.toFixed?.(0) ?? "0"} sales</p>
+                  </div>
                 </div>
-                <div className="text-right">
-                  <p className="font-bold text-sm" style={{ color: item.profit >= 0 ? "#16a34a" : "#ef4444" }}>₱{item.profit.toFixed(2)}</p>
-                  <p className="text-[11px]" style={{ color: textMuted }}>₱{item.revenue.toFixed(0)} sales</p>
+              ))
+            )}
+          </div>
+        ) : (
+          <div className="mb-4">
+            <TierGate required="plus" featureName="Profitability analytics" compact />
+          </div>
+        )}
+
+        {/* Least profitable */}
+        {canAdvanced ? (
+          <div className="rounded-2xl border p-4 mb-4" style={{ background: card, borderColor: cardBorder }}>
+            <SectionHeader title="Least Profitable" tier="plus" />
+            {leastProfitable.length === 0 ? (
+              <p className="text-sm text-center py-2" style={{ color: textMuted }}>No sales yet</p>
+            ) : (
+              leastProfitable.map(item => (
+                <div key={(item as any).productId || item.productName || item.name} className="flex items-center gap-3 py-2 border-b last:border-0" style={{ borderColor: cardBorder }}>
+                  <span className="text-lg">{(item as any).emoji || "⚠️"}</span>
+                  <div className="flex-1">
+                    <p className="text-sm font-medium" style={{ color: text }}>{item.productName || item.name}</p>
+                    <p className="text-xs" style={{ color: textMuted }}>Margin {((item.margin ?? item.profitMargin) * 100).toFixed(1)}%</p>
+                  </div>
+                  <div className="text-right">
+                    <p className="font-bold text-sm" style={{ color: "#ef4444" }}>PHP{(item.grossProfit ?? item.profit ?? 0).toFixed(2)}</p>
+                    <p className="text-[11px]" style={{ color: textMuted }}>PHP{item.totalRevenue?.toFixed?.(0) ?? item.revenue?.toFixed?.(0) ?? "0"} sales</p>
+                  </div>
                 </div>
-              </div>
-            ))
-          )}
-        </div>
+              ))
+            )}
+          </div>
+        ) : null}
 
         {/* Slow Moving - Premium */}
         {canAccess(sub, "premium") ? (
@@ -326,29 +380,58 @@ export function AnalyticsScreen() {
           </div>
         )}
 
-        {/* Community Dashboard teaser - Premium */}
-        {canAccess(sub, "premium") ? (
-          <div className="rounded-2xl p-4 mb-4" style={{ background: "linear-gradient(135deg, #1e3a8a, #1d4ed8)", border: "1px solid #3b82f6" }}>
-            <div className="flex items-center gap-2 mb-2">
-              <Users size={16} className="text-blue-200" />
-              <p className="text-white font-bold text-sm">{t.communityDashboard}</p>
-              <TierBadge tier="premium" size="xs" />
-            </div>
-            <p className="text-blue-200 text-xs mb-3">{t.communityDesc}</p>
-            <div className="grid grid-cols-3 gap-2">
-              {["Coke", "Lucky Me", "Chippy"].map(item => (
-                <div key={item} className="rounded-xl py-2 text-center" style={{ background: "rgba(255,255,255,0.15)" }}>
-                  <p className="text-white text-xs font-semibold">{item}</p>
-                  <p className="text-blue-300" style={{ fontSize: "9px" }}>trending nearby</p>
+        {/* Community Insights - Premium */}
+        {canPremium ? (
+          <div className="rounded-2xl border p-4 mb-4" style={{ background: card, borderColor: cardBorder }}>
+            <SectionHeader title="Community Insights" tier="premium" />
+            {communityInsights.length === 0 ? (
+              <p className="text-sm text-center py-2" style={{ color: textMuted }}>No community data yet</p>
+            ) : (
+              communityInsights.map(stat => (
+                <div key={stat.productName} className="flex items-center gap-3 py-2 border-b last:border-0" style={{ borderColor: cardBorder }}>
+                  <span className="text-lg">📊</span>
+                  <div className="flex-1">
+                    <p className="text-sm font-medium" style={{ color: text }}>{stat.productName}</p>
+                    <p className="text-xs" style={{ color: textMuted }}>
+                      {stat.totalSalesVolume} units · PHP{stat.averagePrice.toFixed(2)} avg
+                    </p>
+                  </div>
+                  <span className="text-xs font-bold px-2 py-1 rounded-full" style={{ background: isDark ? "#1e3a8a" : "#e0e7ff", color: "#1d4ed8" }}>
+                    {stat.totalStoresSelling} stores
+                  </span>
                 </div>
-              ))}
-            </div>
+              ))
+            )}
           </div>
         ) : (
           <div className="mb-4">
             <TierGate required="premium" featureName={t.communityDashboard} compact />
           </div>
         )}
+
+        {/* Benchmark Analytics - Premium */}
+        {canPremium ? (
+          <div className="rounded-2xl border p-4 mb-4" style={{ background: card, borderColor: cardBorder }}>
+            <SectionHeader title="Store Benchmark" tier="premium" />
+            {benchmark.map(row => (
+              <div key={row.metric} className="flex items-center gap-3 py-2 border-b last:border-0" style={{ borderColor: cardBorder }}>
+                <div className="flex-1">
+                  <p className="text-sm font-medium" style={{ color: text }}>{row.metric}</p>
+                  <p className="text-xs" style={{ color: textMuted }}>{row.description}</p>
+                </div>
+                <div className="text-right">
+                  <p className="text-sm font-bold" style={{ color: row.direction === "above" ? "#16a34a" : row.direction === "below" ? "#ef4444" : text }}>
+                    PHP{row.storeValue.toFixed(2)}
+                  </p>
+                  <p className="text-[11px]" style={{ color: textMuted }}>Peers: PHP{row.communityAverage.toFixed(2)}</p>
+                </div>
+                <span className="text-xs font-bold px-2 py-1 rounded-full" style={{ background: row.direction === "above" ? "#dcfce7" : "#fef2f2", color: row.direction === "above" ? "#166534" : "#b91c1c" }}>
+                  {row.delta >= 0 ? "+" : ""}{row.delta.toFixed(2)}
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : null}
 
         {/* Recent Transactions */}
         <div className="rounded-2xl border overflow-hidden mb-4" style={{ background: card, borderColor: cardBorder }}>
