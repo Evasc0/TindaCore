@@ -1,6 +1,7 @@
 import { isSupabaseConfigured, supabase } from "./supabaseClient";
 import {
   getDirtyRows,
+  getDataScope,
   markSynced,
   upsertRemote,
   latestUpdate,
@@ -9,6 +10,9 @@ import {
 import { getSyncMarker, setSyncMarker } from "../database/sqlite";
 
 const defaultTables: Table[] = [
+  "accounts",
+  "stores",
+  "store_settings",
   "products",
   "customers",
   "sales",
@@ -17,13 +21,30 @@ const defaultTables: Table[] = [
   "utang_payments",
   "pabili_orders",
   "expenses",
-  "settings",
 ];
 
 const isOnline = () => (typeof navigator !== "undefined" ? navigator.onLine : true);
 
+const markerKey = (table: Table, accountId: string, storeId: string) => `${table}:${accountId}:${storeId}`;
+
+function applyScopeFilter(query: any, table: Table, accountId: string, storeId: string) {
+  if (table === "accounts") {
+    return query.eq("id", accountId);
+  }
+  if (table === "stores") {
+    return query.eq("id", storeId).eq("account_id", accountId);
+  }
+  if (table === "store_settings") {
+    return query.eq("store_id", storeId);
+  }
+  return query.eq("account_id", accountId).eq("store_id", storeId);
+}
+
 export async function pushLocalChanges(tables: Table[] = defaultTables) {
   if (!supabase || !isOnline()) return { skipped: true };
+  const scope = getDataScope();
+  if (!scope) return { skipped: true };
+
   for (const table of tables) {
     const dirty = await getDirtyRows(table);
     if (!dirty.length) continue;
@@ -31,27 +52,33 @@ export async function pushLocalChanges(tables: Table[] = defaultTables) {
     const { error } = await supabase.from(table).upsert(deduped, { onConflict: "id" });
     if (error) throw error;
     await markSynced(table, deduped.map(r => String(r.id)));
-    await setSyncMarker(table, Date.now());
+    await setSyncMarker(markerKey(table, scope.accountId, scope.storeId), Date.now());
   }
   return { ok: true };
 }
 
 export async function pullRemoteChanges(tables: Table[] = defaultTables) {
   if (!supabase || !isOnline()) return { skipped: true };
+  const scope = getDataScope();
+  if (!scope) return { skipped: true };
+
   for (const table of tables) {
-    const marker = await getSyncMarker(table);
+    const syncKey = markerKey(table, scope.accountId, scope.storeId);
+    const marker = await getSyncMarker(syncKey);
     const localLatest = await latestUpdate(table);
     const since = Math.max(marker, localLatest);
-    const { data, error } = await supabase
+    let query: any = supabase
       .from(table)
       .select("*")
       .gt("updated_at", since || 0);
+    query = applyScopeFilter(query, table, scope.accountId, scope.storeId);
+    const { data, error } = await query;
     if (error) throw error;
     if (data && data.length) {
       const rows = data.map(row => ({ ...row, is_dirty: 0 }));
       await upsertRemote(table, rows);
     }
-    await setSyncMarker(table, Date.now());
+    await setSyncMarker(syncKey, Date.now());
   }
   return { ok: true };
 }

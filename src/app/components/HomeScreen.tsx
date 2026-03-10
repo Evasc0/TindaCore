@@ -369,7 +369,7 @@ export function HomeScreen() {
 
         {/* Management Mode Button */}
         <button
-          onClick={() => navigate("/management")}
+          onClick={() => navigate("/enter-pin")}
           className="w-full flex items-center gap-3 px-5 py-4 rounded-2xl font-bold transition-all active:scale-[0.98]"
           style={{
             background: "linear-gradient(135deg, #0f172a, #1e3a8a)",

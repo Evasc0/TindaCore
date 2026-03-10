@@ -1,6 +1,8 @@
 import React, { createContext, useContext, useState, useCallback, useMemo, useEffect } from "react";
 import {
   initializeDatabase,
+  setDataScope,
+  clearDataScope,
   getProducts as loadProducts,
   createProduct as persistProduct,
   updateProductRecord,
@@ -19,6 +21,18 @@ import {
   saveSettings as persistSettings,
   getSettings as loadSettings,
 } from "../services/databaseService";
+import {
+  type AccountRecord,
+  type StoreRecord,
+  type SessionRecord,
+  type AuthSessionBundle,
+  createAccount as createAccountRecord,
+  login as loginAccount,
+  logout as logoutAccount,
+  getCurrentSession as loadCurrentSession,
+  setManagementPin,
+  verifyManagementPinForStore,
+} from "../services/authService";
 import { syncAll } from "../sync/syncService";
 import { generateRestockSuggestions, RestockSuggestion } from "../ai/restockEngine";
 import {
@@ -150,6 +164,7 @@ export interface StoreSettings {
   gcashNumber: string;
   paymayaNumber: string;
   managementPIN: string;
+  hasManagementPin: boolean;
   isOnboardingComplete: boolean;
   enableUtang: boolean;
   enablePabili: boolean;
@@ -761,6 +776,21 @@ interface StoreContextType {
   chatMessages: ChatMessage[];
   settings: StoreSettings;
   t: typeof translations["en"];
+  currentAccount: AccountRecord | null;
+  currentStore: StoreRecord | null;
+  session: SessionRecord | null;
+  managementUnlocked: boolean;
+  isHydrated: boolean;
+  createAccount: (
+    ownerName: string,
+    storeName: string,
+    emailOrMobile: string,
+    password: string
+  ) => Promise<void>;
+  login: (emailOrMobile: string, password: string) => Promise<void>;
+  logout: () => Promise<void>;
+  verifyManagementPin: (pin: string) => Promise<boolean>;
+  createManagementPin: (pin: string) => Promise<boolean>;
   // Mode
   isManagementMode: boolean;
   operatingUser: string;
@@ -1000,7 +1030,8 @@ const initialSettings: StoreSettings = {
   subscription: "free",
   gcashNumber: "09171234567",
   paymayaNumber: "",
-  managementPIN: "1234",
+  managementPIN: "",
+  hasManagementPin: false,
   isOnboardingComplete: false,
   enableUtang: true,
   enablePabili: true,
@@ -1010,108 +1041,159 @@ const initialSettings: StoreSettings = {
 
 // ─── Provider ──────────────────────────────────────────────────────────────────
 export function StoreProvider({ children }: { children: React.ReactNode }) {
-  const [products, setProducts] = useState<Product[]>(initialProducts);
+  const [products, setProducts] = useState<Product[]>([]);
   const [cart, setCart] = useState<CartItem[]>([]);
-  const [customers, setCustomers] = useState(initialCustomers);
-  const [sales, setSales] = useState<Sale[]>(initialSales);
-  const [pabiliOrders, setPabiliOrders] = useState<PabiliOrder[]>(initialPabiliOrders);
-  const [expenses, setExpenses] = useState<Expense[]>(initialExpenses);
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  const [sales, setSales] = useState<Sale[]>([]);
+  const [pabiliOrders, setPabiliOrders] = useState<PabiliOrder[]>([]);
+  const [expenses, setExpenses] = useState<Expense[]>([]);
   const [restockList, setRestockList] = useState<RestockItem[]>([]);
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
   const [restockOrders, setRestockOrders] = useState<RestockOrder[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [settings, setSettings] = useState<StoreSettings>(initialSettings);
-  // Mode state (session only)
-  const [isManagementMode, setIsManagementMode] = useState(false);
+  const [settings, setSettings] = useState<StoreSettings>({
+    ...initialSettings,
+    managementPIN: "",
+    hasManagementPin: false,
+  });
+  const [currentAccount, setCurrentAccount] = useState<AccountRecord | null>(null);
+  const [currentStore, setCurrentStore] = useState<StoreRecord | null>(null);
+  const [session, setSession] = useState<SessionRecord | null>(null);
+  const [managementUnlocked, setManagementUnlocked] = useState(false);
+  const [isHydrated, setIsHydrated] = useState(false);
   const [operatingUser, setOperatingUserState] = useState("Helper");
 
   const t = translations[settings.language];
   const cartTotal = cart.reduce((sum, item) => sum + item.subtotal, 0);
   const communityStats = useMemo(() => computeCommunityProductStats({ sales, products }), [sales, products]);
 
-  const seedInitialData = useCallback(async () => {
-    await Promise.all(initialProducts.map(p => persistProduct(p)));
-    for (const customer of initialCustomers) {
-      await persistCustomer(customer.name, customer.phone, customer.id);
-      for (const tx of customer.transactions) {
-        await persistUtangRecord({
-          id: tx.id,
-          customerId: customer.id,
-          items: tx.items,
-          amount: tx.amount,
-          balance: tx.balance,
-          date: tx.date,
-        });
-      }
-    }
-    for (const sale of initialSales) {
-      await persistSale({
-        id: sale.id,
-        items: sale.items,
-        total: sale.total,
-        paymentType: sale.paymentType,
-        isUtang: sale.isUtang,
-        customerId: sale.customerId,
-        timestamp: new Date(sale.timestamp).getTime(),
-      });
-    }
-    for (const order of initialPabiliOrders) {
-      await persistPabiliOrder({
-        id: order.id,
-        items: order.items,
-        customerName: order.customerName,
-        customerPhone: order.customerPhone,
-        status: order.status,
-        timestamp: new Date(order.date || order.timestamp).getTime(),
-        note: order.note,
-        total: order.total,
-      });
-    }
-    for (const exp of initialExpenses) {
-      await persistExpense(exp);
-    }
-    await persistSettings(initialSettings);
+  const resetScopedState = useCallback(() => {
+    setCurrentAccount(null);
+    setCurrentStore(null);
+    setSession(null);
+    setProducts([]);
+    setCart([]);
+    setCustomers([]);
+    setSales([]);
+    setPabiliOrders([]);
+    setExpenses([]);
+    setRestockList([]);
+    setSuppliers([]);
+    setRestockOrders([]);
+    setManagementUnlocked(false);
+    setOperatingUserState("Helper");
+    setSettings({
+      ...initialSettings,
+      managementPIN: "",
+      hasManagementPin: false,
+    });
   }, []);
+
+  const buildScopedDefaultSettings = useCallback((account: AccountRecord, store: StoreRecord): StoreSettings => ({
+    ...initialSettings,
+    storeName: store.storeName || initialSettings.storeName,
+    ownerName: account.ownerName || initialSettings.ownerName,
+    subscription: store.subscriptionTier || initialSettings.subscription,
+    managementPIN: "",
+    hasManagementPin: false,
+    gcashNumber: "",
+    paymayaNumber: "",
+    address: "",
+    isOnboardingComplete: false,
+  }), []);
+
+  const hydrateScopedData = useCallback(async (bundle: AuthSessionBundle) => {
+    setDataScope({ accountId: bundle.account.id, storeId: bundle.store.id });
+    const [dbProducts, dbCustomers, dbSales, dbPabili, dbExpenses, savedSettings] = await Promise.all([
+      loadProducts(),
+      loadCustomers(),
+      loadSales(),
+      loadPabiliOrders(),
+      loadExpenses(),
+      loadSettings(),
+    ]);
+    const fallback = buildScopedDefaultSettings(bundle.account, bundle.store);
+    const resolved = savedSettings
+      ? {
+          ...fallback,
+          ...savedSettings,
+          storeName: bundle.store.storeName,
+          ownerName: bundle.account.ownerName,
+          subscription: bundle.store.subscriptionTier,
+          managementPIN: "",
+        }
+      : fallback;
+    setCurrentAccount(bundle.account);
+    setCurrentStore(bundle.store);
+    setSession(bundle.session);
+    setSettings(resolved);
+    setProducts(dbProducts);
+    setCustomers(dbCustomers);
+    setSales(dbSales);
+    setPabiliOrders(dbPabili);
+    setExpenses(dbExpenses);
+    setSuppliers(buildSuggestedSuppliers(dbProducts));
+    setOperatingUserState(bundle.account.ownerName || "Helper");
+    setManagementUnlocked(false);
+    await syncAll().catch(err => console.debug("Initial sync skipped", err));
+  }, [buildScopedDefaultSettings]);
 
   useEffect(() => {
     let active = true;
     const hydrate = async () => {
-      await initializeDatabase();
-      let savedSettings = await loadSettings();
-      if (!savedSettings) {
-        await seedInitialData();
-        savedSettings = initialSettings;
+      setIsHydrated(false);
+      try {
+        await initializeDatabase();
+        const activeSession = await loadCurrentSession();
+        if (!active) return;
+        if (!activeSession) {
+          clearDataScope();
+          resetScopedState();
+          return;
+        }
+        await hydrateScopedData(activeSession);
+      } catch (err) {
+        console.error("StoreProvider hydration failed", err);
+        clearDataScope();
+        resetScopedState();
+      } finally {
+        if (active) setIsHydrated(true);
       }
-      const [dbProducts, dbCustomers, dbSales, dbPabili, dbExpenses] = await Promise.all([
-        loadProducts(),
-        loadCustomers(),
-        loadSales(),
-        loadPabiliOrders(),
-        loadExpenses(),
-      ]);
-      if (!dbProducts.length) {
-        await seedInitialData();
-      }
-      if (!active) return;
-      const baseProducts = dbProducts.length ? dbProducts : initialProducts;
-      setSettings(savedSettings || initialSettings);
-      setProducts(baseProducts);
-      setCustomers(dbCustomers.length ? dbCustomers : initialCustomers);
-      setSales(dbSales.length ? dbSales : initialSales);
-      setPabiliOrders(dbPabili.length ? dbPabili : initialPabiliOrders);
-      setExpenses(dbExpenses.length ? dbExpenses : initialExpenses);
-      setSuppliers(buildSuggestedSuppliers(baseProducts));
-      await syncAll().catch(err => console.debug("Initial sync skipped", err));
     };
-    hydrate();
-    const interval = typeof window !== "undefined"
-      ? window.setInterval(() => { syncAll().catch(() => {}); }, 5 * 60 * 1000)
-      : null;
+    void hydrate();
     return () => {
       active = false;
-      if (interval) window.clearInterval(interval);
     };
-  }, [seedInitialData]);
+  }, [hydrateScopedData, resetScopedState]);
+
+  useEffect(() => {
+    if (!session || typeof window === "undefined") return;
+    const interval = window.setInterval(() => {
+      syncAll().catch(() => {});
+    }, 5 * 60 * 1000);
+    return () => window.clearInterval(interval);
+  }, [session]);
+
+  const createAccount = useCallback(async (
+    ownerName: string,
+    storeName: string,
+    emailOrMobile: string,
+    password: string
+  ) => {
+    const bundle = await createAccountRecord(ownerName, storeName, emailOrMobile, password);
+    await hydrateScopedData(bundle);
+  }, [hydrateScopedData]);
+
+  const login = useCallback(async (emailOrMobile: string, password: string) => {
+    const bundle = await loginAccount(emailOrMobile, password);
+    await hydrateScopedData(bundle);
+  }, [hydrateScopedData]);
+
+  const logout = useCallback(async () => {
+    await logoutAccount();
+    clearDataScope();
+    resetScopedState();
+  }, [resetScopedState]);
 
   const updateSettings = useCallback((s: Partial<StoreSettings>) => {
     setSettings(prev => {
@@ -1129,17 +1211,26 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setChatMessages(getAllMessages());
   }, []);
 
-  // Mode management
-  const enterManagementMode = useCallback((pin: string): boolean => {
-    if (pin === settings.managementPIN) {
-      setIsManagementMode(true);
-      return true;
-    }
-    return false;
-  }, [settings.managementPIN]);
+  const verifyManagementPin = useCallback(async (pin: string) => {
+    if (!currentStore) return false;
+    const ok = await verifyManagementPinForStore(currentStore.id, pin);
+    if (ok) setManagementUnlocked(true);
+    return ok;
+  }, [currentStore]);
+
+  const createManagementPin = useCallback(async (pin: string) => {
+    if (!currentStore) return false;
+    await setManagementPin(currentStore.id, pin);
+    setSettings(prev => ({ ...prev, hasManagementPin: true, managementPIN: "" }));
+    setManagementUnlocked(true);
+    return true;
+  }, [currentStore]);
+
+  // Legacy mode methods retained for compatibility with existing components.
+  const enterManagementMode = useCallback((_pin: string): boolean => false, []);
 
   const exitManagementMode = useCallback(() => {
-    setIsManagementMode(false);
+    setManagementUnlocked(false);
   }, []);
 
   const completeOnboarding = useCallback((data: {
@@ -1148,34 +1239,29 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     enableBarcodeScanner?: boolean; enableReceiptPrinter?: boolean;
     subscription?: SubscriptionTier;
   }) => {
-    setSettings(prev => ({
-      ...prev,
-      storeName: data.storeName,
-      ownerName: data.ownerName,
-      address: data.address || prev.address,
-      managementPIN: data.pin,
-      isOnboardingComplete: true,
-      enableUtang: data.enableUtang ?? true,
-      enablePabili: data.enablePabili ?? true,
-      enableBarcodeScanner: data.enableBarcodeScanner ?? true,
-      enableReceiptPrinter: data.enableReceiptPrinter ?? false,
-      subscription: data.subscription ?? prev.subscription,
-    }));
-    void persistSettings({
+    const next: StoreSettings = {
       ...settings,
       storeName: data.storeName,
       ownerName: data.ownerName,
       address: data.address || settings.address,
-      managementPIN: data.pin,
+      managementPIN: "",
+      hasManagementPin: settings.hasManagementPin || /^\d{4}$/.test(data.pin),
       isOnboardingComplete: true,
       enableUtang: data.enableUtang ?? true,
       enablePabili: data.enablePabili ?? true,
       enableBarcodeScanner: data.enableBarcodeScanner ?? true,
       enableReceiptPrinter: data.enableReceiptPrinter ?? false,
       subscription: data.subscription ?? settings.subscription,
-    });
-    setIsManagementMode(true);
-  }, [settings]);
+    };
+    setSettings(next);
+    void persistSettings(next);
+    if (/^\d{4}$/.test(data.pin)) {
+      setManagementUnlocked(true);
+      void createManagementPin(data.pin);
+    } else {
+      setManagementUnlocked(true);
+    }
+  }, [createManagementPin, settings]);
 
   const setOperatingUser = useCallback((name: string) => {
     setOperatingUserState(name);
@@ -1633,10 +1719,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const getCommunityInsights = useCallback(() => communityStats, [communityStats]);
 
   const getBenchmarkSnapshot = useCallback(() => buildBenchmark(sales, products, { communityStats }), [sales, products, communityStats]);
+  const isManagementMode = managementUnlocked;
 
   return (
     <StoreContext.Provider value={{
       products, cart, customers, sales, pabiliOrders, expenses, restockList, suppliers, restockOrders, chatMessages, settings, t,
+      currentAccount, currentStore, session, managementUnlocked, isHydrated,
+      createAccount, login, logout, verifyManagementPin, createManagementPin,
       isManagementMode, operatingUser,
       enterManagementMode, exitManagementMode, completeOnboarding, setOperatingUser,
       addProduct, updateProduct, deleteProduct, addStock, searchProducts,

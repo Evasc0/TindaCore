@@ -1,12 +1,12 @@
 import React, { useState } from "react";
 import { useNavigate } from "react-router";
-import { ArrowLeft, Store, User, MapPin, Moon, Sun, Globe, Check, ChevronDown, Smartphone, CreditCard, QrCode, Headphones, Key, Download, Crown, Zap } from "lucide-react";
+import { ArrowLeft, Store, Moon, Sun, Globe, Check, ChevronDown, Smartphone, CreditCard, Headphones, Key, Download, Crown, Zap, LogOut } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import { useStore, StoreSettings } from "../context/StoreContext";
 import { TierBadge } from "./TierComponents";
 
 export function SettingsScreen() {
-  const { settings, updateSettings, t } = useStore();
+  const { settings, updateSettings, logout, t } = useStore();
   const navigate = useNavigate();
   const isDark = settings.theme === "dark";
 
@@ -15,18 +15,28 @@ export function SettingsScreen() {
   const [showLangMenu, setShowLangMenu] = useState(false);
   const [activeSection, setActiveSection] = useState<string | null>("store");
   const [showPayQR, setShowPayQR] = useState<null | "gcash" | "paymaya">(null);
+  const [loggingOut, setLoggingOut] = useState(false);
 
   const card = isDark ? "#1f2937" : "#ffffff";
   const cardBorder = isDark ? "#374151" : "#f3f4f6";
   const bg = isDark ? "#111827" : "#f9fafb";
   const text = isDark ? "#f9fafb" : "#111827";
   const textMuted = isDark ? "#9ca3af" : "#6b7280";
-  const inputBg = isDark ? "#374151" : "#f9fafb";
 
   const handleSave = () => {
     updateSettings(form);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
+  };
+
+  const handleLogout = async () => {
+    setLoggingOut(true);
+    try {
+      await logout();
+      navigate("/login", { replace: true });
+    } finally {
+      setLoggingOut(false);
+    }
   };
 
   const Section = ({ id, icon: Icon, title, color, children }: { id: string; icon: any; title: string; color: string; children: React.ReactNode }) => {
@@ -109,20 +119,25 @@ export function SettingsScreen() {
 
         {/* Management PIN */}
         <Section id="security" icon={Key} title={settings.language === "fil" ? "Seguridad at PIN" : "Security & PIN"} color="#ef4444">
-          <Field
-            label={settings.language === "fil" ? "Management PIN (4 digits)" : "Management PIN (4 digits)"}
-            value={form.managementPIN || ""}
-            onChange={v => setForm(f => ({ ...f, managementPIN: v.replace(/\D/g, "").slice(0, 4) }))}
-            placeholder="e.g. 1234"
-            type="password"
-          />
-          <div className="px-4 py-3">
-            <p className="text-xs" style={{ color: textMuted }}>
-              {settings.language === "fil"
-                ? "Ang PIN na ito ay kailangan para ma-access ang Management Mode."
-                : "This PIN is required to access Management Mode. Keep it private from helpers."}
-            </p>
-          </div>
+          <button
+            onClick={() => navigate("/enter-pin?mode=change")}
+            className="w-full flex items-center justify-between px-4 py-3.5 border-b"
+            style={{ borderColor: cardBorder }}
+          >
+            <div className="text-left">
+              <p className="text-sm font-semibold" style={{ color: text }}>
+                {settings.hasManagementPin
+                  ? (settings.language === "fil" ? "Palitan ang Management PIN" : "Change Management PIN")
+                  : (settings.language === "fil" ? "Gumawa ng Management PIN" : "Create Management PIN")}
+              </p>
+              <p className="text-xs mt-0.5" style={{ color: textMuted }}>
+                {settings.language === "fil"
+                  ? "4-digit PIN para sa Management Mode"
+                  : "4-digit PIN for Management Mode access"}
+              </p>
+            </div>
+            <ChevronDown size={16} style={{ color: textMuted, transform: "rotate(-90deg)" }} />
+          </button>
         </Section>
 
         {/* Feature Toggles */}
@@ -349,6 +364,18 @@ export function SettingsScreen() {
             <p className="text-xs" style={{ color: textMuted }}>Sari-Sari POS v1.0.0 · Offline-First</p>
           </div>
         </Section>
+
+        <div className="rounded-2xl overflow-hidden border mb-3" style={{ background: card, borderColor: cardBorder }}>
+          <button
+            onClick={handleLogout}
+            disabled={loggingOut}
+            className="w-full flex items-center justify-center gap-2 px-4 py-3.5 text-sm font-semibold disabled:opacity-60"
+            style={{ color: "#ef4444" }}
+          >
+            <LogOut size={15} />
+            {loggingOut ? "Logging out..." : "Log Out"}
+          </button>
+        </div>
 
         <div style={{ height: "8px" }} />
       </div>

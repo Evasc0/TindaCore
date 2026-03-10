@@ -11,9 +11,9 @@ export function OnboardingScreen() {
   const isDark = settings.theme === "dark";
 
   const [step, setStep] = useState<Step>("welcome");
-  const [storeName, setStoreName] = useState("");
-  const [ownerName, setOwnerName] = useState("");
-  const [address, setAddress] = useState("");
+  const [storeName, setStoreName] = useState(settings.storeName || "");
+  const [ownerName, setOwnerName] = useState(settings.ownerName || "");
+  const [address, setAddress] = useState(settings.address || "");
   const [pin, setPin] = useState("");
   const [confirmPin, setConfirmPin] = useState("");
   const [showPin, setShowPin] = useState(false);

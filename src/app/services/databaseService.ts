@@ -18,6 +18,9 @@ import {
 } from "../database/sqlite";
 
 export type Table =
+  | "accounts"
+  | "stores"
+  | "store_settings"
   | "products"
   | "sales"
   | "sale_items"
@@ -25,8 +28,14 @@ export type Table =
   | "utang_records"
   | "utang_payments"
   | "pabili_orders"
-  | "expenses"
-  | "settings";
+  | "expenses";
+
+export interface DataScope {
+  accountId: string;
+  storeId: string;
+}
+
+let currentScope: DataScope | null = null;
 
 const now = () => Date.now();
 const generateId = () => Number(`${Date.now()}${Math.floor(Math.random() * 1000)}`);
@@ -38,8 +47,9 @@ const stableHash = (value: string) => {
   for (let i = 0; i < value.length; i += 1) {
     hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
   }
-  return 1_000_000 + (hash % 9_000_000_000); // keep within safe integer range
+  return 1_000_000 + (hash % 9_000_000_000);
 };
+
 const toNumericId = (value?: string | number) => {
   if (value === undefined || value === null) return generateId();
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -47,39 +57,6 @@ const toNumericId = (value?: string | number) => {
   if (Number.isFinite(parsed)) return parsed;
   return stableHash(String(value));
 };
-
-function resolveExistingIdInTx(
-  db: { exec: (sql: string, params?: Record<string, any>) => any[] },
-  table: "products" | "customers" | "utang_records",
-  incoming: DbId
-): ResolvedId {
-  const numeric = toNumericId(incoming);
-  const numericRows = execRows(db as any, `SELECT id FROM ${table} WHERE id = :id`, { ":id": numeric });
-  if (numericRows.length) return { id: numericRows[0].id, exists: true };
-
-  if (typeof incoming === "string") {
-    const rawRows = execRows(db as any, `SELECT id FROM ${table} WHERE id = :id`, { ":id": incoming });
-    if (rawRows.length) return { id: rawRows[0].id, exists: true };
-  }
-
-  return { id: numeric, exists: false };
-}
-
-async function resolveExistingId(
-  table: "products" | "customers" | "utang_records",
-  incoming: DbId
-): Promise<ResolvedId> {
-  const numeric = toNumericId(incoming);
-  const byNumeric = await queryOne<{ id: DbId }>(`SELECT id FROM ${table} WHERE id = :id`, { ":id": numeric });
-  if (byNumeric) return { id: byNumeric.id, exists: true };
-
-  if (typeof incoming === "string") {
-    const byRaw = await queryOne<{ id: DbId }>(`SELECT id FROM ${table} WHERE id = :id`, { ":id": incoming });
-    if (byRaw) return { id: byRaw.id, exists: true };
-  }
-
-  return { id: numeric, exists: false };
-}
 
 const unitFactor = (unit?: Unit, conversion?: number) => {
   if (unit === "pack" || unit === "box") return conversion || 1;
@@ -106,46 +83,160 @@ async function getDb() {
   await initDb();
 }
 
+function requireScope() {
+  if (!currentScope) {
+    throw new Error("No active account/store scope.");
+  }
+  return currentScope;
+}
+
+function scopeParams(scope: DataScope) {
+  return {
+    ":account_id": scope.accountId,
+    ":store_id": scope.storeId,
+  };
+}
+
+function scopeFilterForTable(table: Table, scope: DataScope) {
+  if (table === "accounts") {
+    return { clause: "id = :account_id", params: { ":account_id": scope.accountId } };
+  }
+  if (table === "stores") {
+    return {
+      clause: "id = :store_id AND account_id = :account_id",
+      params: scopeParams(scope),
+    };
+  }
+  if (table === "store_settings") {
+    return { clause: "store_id = :store_id", params: { ":store_id": scope.storeId } };
+  }
+  return {
+    clause: "account_id = :account_id AND store_id = :store_id",
+    params: scopeParams(scope),
+  };
+}
+
+function rowMatchesScope(table: Table, row: any, scope: DataScope) {
+  if (table === "accounts") return String(row.id) === scope.accountId;
+  if (table === "stores") return String(row.id) === scope.storeId && String(row.account_id) === scope.accountId;
+  if (table === "store_settings") return String(row.store_id) === scope.storeId;
+  return String(row.account_id) === scope.accountId && String(row.store_id) === scope.storeId;
+}
+
+function resolveExistingIdInTx(
+  db: { exec: (sql: string, params?: Record<string, any>) => any[] },
+  table: "products" | "customers" | "utang_records",
+  incoming: DbId,
+  scope: DataScope
+): ResolvedId {
+  const numeric = toNumericId(incoming);
+  const byNumeric = execRows(
+    db as any,
+    `SELECT id FROM ${table} WHERE id = :id AND account_id = :account_id AND store_id = :store_id`,
+    { ":id": numeric, ...scopeParams(scope) }
+  );
+  if (byNumeric.length) return { id: byNumeric[0].id, exists: true };
+
+  if (typeof incoming === "string") {
+    const byRaw = execRows(
+      db as any,
+      `SELECT id FROM ${table} WHERE id = :id AND account_id = :account_id AND store_id = :store_id`,
+      { ":id": incoming, ...scopeParams(scope) }
+    );
+    if (byRaw.length) return { id: byRaw[0].id, exists: true };
+  }
+
+  return { id: numeric, exists: false };
+}
+
+async function resolveExistingId(
+  table: "products" | "customers" | "utang_records",
+  incoming: DbId,
+  scope: DataScope
+): Promise<ResolvedId> {
+  const numeric = toNumericId(incoming);
+  const byNumeric = await queryOne<{ id: DbId }>(
+    `SELECT id FROM ${table} WHERE id = :id AND account_id = :account_id AND store_id = :store_id`,
+    { ":id": numeric, ...scopeParams(scope) }
+  );
+  if (byNumeric) return { id: byNumeric.id, exists: true };
+
+  if (typeof incoming === "string") {
+    const byRaw = await queryOne<{ id: DbId }>(
+      `SELECT id FROM ${table} WHERE id = :id AND account_id = :account_id AND store_id = :store_id`,
+      { ":id": incoming, ...scopeParams(scope) }
+    );
+    if (byRaw) return { id: byRaw.id, exists: true };
+  }
+
+  return { id: numeric, exists: false };
+}
+
 export const initializeDatabase = initDb;
 
-// ─── Products ──────────────────────────────────────────────────────────────
+export function setDataScope(scope: DataScope) {
+  currentScope = scope;
+}
+
+export function clearDataScope() {
+  currentScope = null;
+}
+
+export function getDataScope() {
+  return currentScope;
+}
+
+// Products
 export async function getProducts(): Promise<Product[]> {
   await getDb();
-  const rows = await queryAll("SELECT * FROM products ORDER BY name ASC");
+  const scope = requireScope();
+  const rows = await queryAll<any>(
+    "SELECT * FROM products WHERE account_id = :account_id AND store_id = :store_id ORDER BY name ASC",
+    scopeParams(scope)
+  );
   return rows.map(mapProduct);
 }
 
 export async function createProduct(input: Omit<Product, "id"> & { id?: string }): Promise<Product> {
   await getDb();
+  const scope = requireScope();
   const id = toNumericId(input.id);
   const ts = now();
-  const payload = {
-    ":id": id,
-    ":name": input.name,
-    ":barcode": input.barcode || "",
-    ":price": input.price,
-    ":cost": input.cost ?? 0,
-    ":stock": input.stock ?? 0,
-    ":unit": input.unit || "piece",
-    ":base_unit": input.baseUnit || "piece",
-    ":conversion": input.conversion ?? 1,
-    ":category": input.category || "General",
-    ":is_quick_item": input.isQuickItem ? 1 : 0,
-    ":emoji": input.emoji || "🛒",
-    ":ts": ts,
-  };
   await run(
-    `INSERT INTO products (id, name, barcode, price, cost, stock, unit, base_unit, conversion, category, is_quick_item, emoji, updated_at, is_dirty)
-     VALUES (:id, :name, :barcode, :price, :cost, :stock, :unit, :base_unit, :conversion, :category, :is_quick_item, :emoji, :ts, 1)`,
-    payload
+    `INSERT INTO products (
+      id, account_id, store_id, name, barcode, price, cost, stock, unit, base_unit, conversion, category, is_quick_item, emoji, updated_at, is_dirty
+    ) VALUES (
+      :id, :account_id, :store_id, :name, :barcode, :price, :cost, :stock, :unit, :base_unit, :conversion, :category, :is_quick_item, :emoji, :ts, 1
+    )`,
+    {
+      ":id": id,
+      ...scopeParams(scope),
+      ":name": input.name,
+      ":barcode": input.barcode || "",
+      ":price": input.price,
+      ":cost": input.cost ?? 0,
+      ":stock": input.stock ?? 0,
+      ":unit": input.unit || "piece",
+      ":base_unit": input.baseUnit || "piece",
+      ":conversion": input.conversion ?? 1,
+      ":category": input.category || "General",
+      ":is_quick_item": input.isQuickItem ? 1 : 0,
+      ":emoji": input.emoji || "🛒",
+      ":ts": ts,
+    }
   );
   return { ...input, id: String(id) };
 }
 
 export async function updateProduct(input: Partial<Product> & { id: string }) {
   await getDb();
+  const scope = requireScope();
   const fields: string[] = [];
-  const params: Record<string, any> = { ":id": toNumericId(input.id), ":ts": now() };
+  const params: Record<string, any> = {
+    ":id": toNumericId(input.id),
+    ":ts": now(),
+    ...scopeParams(scope),
+  };
   const map: Record<string, string> = {
     name: "name",
     barcode: "barcode",
@@ -166,19 +257,35 @@ export async function updateProduct(input: Partial<Product> & { id: string }) {
     params[`:${column}`] = key === "isQuickItem" ? (value ? 1 : 0) : value;
   });
   if (!fields.length) return;
-  await run(`UPDATE products SET ${fields.join(", ")}, updated_at = :ts, is_dirty = 1 WHERE id = :id`, params);
+  await run(
+    `UPDATE products
+     SET ${fields.join(", ")}, updated_at = :ts, is_dirty = 1
+     WHERE id = :id AND account_id = :account_id AND store_id = :store_id`,
+    params
+  );
 }
 
 export async function deleteProduct(id: string) {
   await getDb();
-  await run("DELETE FROM products WHERE id = :id", { ":id": toNumericId(id) });
+  const scope = requireScope();
+  await run(
+    "DELETE FROM products WHERE id = :id AND account_id = :account_id AND store_id = :store_id",
+    { ":id": toNumericId(id), ...scopeParams(scope) }
+  );
 }
 
-// ─── Sales ─────────────────────────────────────────────────────────────────
+// Sales
 export async function getSales(): Promise<Sale[]> {
   await getDb();
-  const sales = await queryAll<any>("SELECT * FROM sales ORDER BY timestamp DESC");
-  const items = await queryAll<any>("SELECT * FROM sale_items");
+  const scope = requireScope();
+  const sales = await queryAll<any>(
+    "SELECT * FROM sales WHERE account_id = :account_id AND store_id = :store_id ORDER BY timestamp DESC",
+    scopeParams(scope)
+  );
+  const items = await queryAll<any>(
+    "SELECT * FROM sale_items WHERE account_id = :account_id AND store_id = :store_id",
+    scopeParams(scope)
+  );
   const itemsBySale = items.reduce<Record<string, any[]>>((acc, item) => {
     const key = String(item.sale_id);
     if (!acc[key]) acc[key] = [];
@@ -226,19 +333,24 @@ export async function createSale(input: {
   timestamp?: number;
 }) {
   await getDb();
+  const scope = requireScope();
   const saleId = toNumericId(input.id);
   const ts = input.timestamp ?? now();
 
   await runTransaction(async db => {
     const customerRef = input.customerId
-      ? resolveExistingIdInTx(db as any, "customers", input.customerId)
+      ? resolveExistingIdInTx(db as any, "customers", input.customerId, scope)
       : null;
 
     db.run(
-      `INSERT INTO sales (id, total, payment_type, timestamp, customer_id, is_utang, amount_paid, change_due, updated_at, is_dirty)
-       VALUES (:id, :total, :payment_type, :timestamp, :customer_id, :is_utang, :amount_paid, :change_due, :ts, 1)`,
+      `INSERT INTO sales (
+        id, account_id, store_id, total, payment_type, timestamp, customer_id, is_utang, amount_paid, change_due, updated_at, is_dirty
+      ) VALUES (
+        :id, :account_id, :store_id, :total, :payment_type, :timestamp, :customer_id, :is_utang, :amount_paid, :change_due, :ts, 1
+      )`,
       {
         ":id": saleId,
+        ...scopeParams(scope),
         ":total": input.total,
         ":payment_type": input.paymentType,
         ":timestamp": ts,
@@ -253,14 +365,18 @@ export async function createSale(input: {
     for (const item of input.items) {
       const itemId = generateId();
       const productRef = item.productId
-        ? resolveExistingIdInTx(db as any, "products", item.productId)
+        ? resolveExistingIdInTx(db as any, "products", item.productId, scope)
         : null;
 
       db.run(
-        `INSERT INTO sale_items (id, sale_id, product_id, name, quantity, unit, price, cost, subtotal, updated_at, is_dirty)
-         VALUES (:id, :sale_id, :product_id, :name, :quantity, :unit, :price, :cost, :subtotal, :ts, 1)`,
+        `INSERT INTO sale_items (
+          id, account_id, store_id, sale_id, product_id, name, quantity, unit, price, cost, subtotal, updated_at, is_dirty
+        ) VALUES (
+          :id, :account_id, :store_id, :sale_id, :product_id, :name, :quantity, :unit, :price, :cost, :subtotal, :ts, 1
+        )`,
         {
           ":id": itemId,
+          ...scopeParams(scope),
           ":sale_id": saleId,
           ":product_id": productRef?.exists ? productRef.id : null,
           ":name": item.name,
@@ -274,17 +390,22 @@ export async function createSale(input: {
       );
 
       if (productRef?.exists) {
-        const rows = execRows(db, "SELECT conversion, unit FROM products WHERE id = :pid", {
-          ":pid": productRef.id,
-        });
+        const rows = execRows(
+          db as any,
+          "SELECT conversion, unit FROM products WHERE id = :pid AND account_id = :account_id AND store_id = :store_id",
+          { ":pid": productRef.id, ...scopeParams(scope) }
+        );
         const product = rows[0] || { conversion: 1, unit: "piece" };
         const factor = unitFactor(item.unit, product.conversion);
         db.run(
-          `UPDATE products SET stock = stock - :qty, updated_at = :ts, is_dirty = 1 WHERE id = :pid`,
+          `UPDATE products
+           SET stock = stock - :qty, updated_at = :ts, is_dirty = 1
+           WHERE id = :pid AND account_id = :account_id AND store_id = :store_id`,
           {
             ":qty": item.qty * factor,
             ":ts": ts,
             ":pid": productRef.id,
+            ...scopeParams(scope),
           }
         );
       }
@@ -294,12 +415,22 @@ export async function createSale(input: {
   return String(saleId);
 }
 
-// ─── Customers / Utang ─────────────────────────────────────────────────────
+// Customers / Utang
 export async function getCustomers(): Promise<Customer[]> {
   await getDb();
-  const customers = await queryAll<any>("SELECT * FROM customers ORDER BY name ASC");
-  const utang = await queryAll<any>("SELECT * FROM utang_records");
-  const payments = await queryAll<any>("SELECT * FROM utang_payments");
+  const scope = requireScope();
+  const customers = await queryAll<any>(
+    "SELECT * FROM customers WHERE account_id = :account_id AND store_id = :store_id ORDER BY name ASC",
+    scopeParams(scope)
+  );
+  const utang = await queryAll<any>(
+    "SELECT * FROM utang_records WHERE account_id = :account_id AND store_id = :store_id",
+    scopeParams(scope)
+  );
+  const payments = await queryAll<any>(
+    "SELECT * FROM utang_payments WHERE account_id = :account_id AND store_id = :store_id",
+    scopeParams(scope)
+  );
 
   const paymentsByUtang = payments.reduce<Record<string, any[]>>((acc, p) => {
     const key = String(p.utang_id);
@@ -337,10 +468,18 @@ export async function getCustomers(): Promise<Customer[]> {
 
 export async function createCustomer(name: string, phone?: string, id?: string) {
   await getDb();
+  const scope = requireScope();
   const customerId = toNumericId(id);
   await run(
-    `INSERT INTO customers (id, name, phone, updated_at, is_dirty) VALUES (:id, :name, :phone, :ts, 1)`,
-    { ":id": customerId, ":name": name, ":phone": phone || "", ":ts": now() }
+    `INSERT INTO customers (id, account_id, store_id, name, phone, updated_at, is_dirty)
+     VALUES (:id, :account_id, :store_id, :name, :phone, :ts, 1)`,
+    {
+      ":id": customerId,
+      ...scopeParams(scope),
+      ":name": name,
+      ":phone": phone || "",
+      ":ts": now(),
+    }
   );
   return String(customerId);
 }
@@ -354,17 +493,22 @@ export async function addUtangRecord(data: {
   date: string;
 }) {
   await getDb();
+  const scope = requireScope();
   const id = toNumericId(data.id);
-  const customerRef = await resolveExistingId("customers", data.customerId);
+  const customerRef = await resolveExistingId("customers", data.customerId, scope);
   if (!customerRef.exists) {
     throw new Error(`Cannot create utang record: customer not found (${data.customerId})`);
   }
 
   await run(
-    `INSERT INTO utang_records (id, customer_id, amount, balance, date, items_json, updated_at, is_dirty)
-     VALUES (:id, :customer_id, :amount, :balance, :date, :items_json, :ts, 1)`,
+    `INSERT INTO utang_records (
+      id, account_id, store_id, customer_id, amount, balance, date, items_json, updated_at, is_dirty
+    ) VALUES (
+      :id, :account_id, :store_id, :customer_id, :amount, :balance, :date, :items_json, :ts, 1
+    )`,
     {
       ":id": id,
+      ...scopeParams(scope),
       ":customer_id": customerRef.id,
       ":amount": data.amount,
       ":balance": data.balance,
@@ -378,31 +522,50 @@ export async function addUtangRecord(data: {
 
 export async function recordPayment(utangId: string, amount: number, date: string) {
   await getDb();
+  const scope = requireScope();
   const paymentId = generateId();
   const ts = now();
-  const utangRef = await resolveExistingId("utang_records", utangId);
+  const utangRef = await resolveExistingId("utang_records", utangId, scope);
   if (!utangRef.exists) {
     throw new Error(`Cannot record payment: utang record not found (${utangId})`);
   }
 
   await runTransaction(db => {
     db.run(
-      `INSERT INTO utang_payments (id, utang_id, amount, date, updated_at, is_dirty)
-       VALUES (:id, :utang_id, :amount, :date, :ts, 1)`,
-      { ":id": paymentId, ":utang_id": utangRef.id, ":amount": amount, ":date": date, ":ts": ts }
+      `INSERT INTO utang_payments (id, account_id, store_id, utang_id, amount, date, updated_at, is_dirty)
+       VALUES (:id, :account_id, :store_id, :utang_id, :amount, :date, :ts, 1)`,
+      {
+        ":id": paymentId,
+        ...scopeParams(scope),
+        ":utang_id": utangRef.id,
+        ":amount": amount,
+        ":date": date,
+        ":ts": ts,
+      }
     );
     db.run(
-      `UPDATE utang_records SET balance = balance - :amount, updated_at = :ts, is_dirty = 1 WHERE id = :utang_id`,
-      { ":amount": amount, ":ts": ts, ":utang_id": utangRef.id }
+      `UPDATE utang_records
+       SET balance = balance - :amount, updated_at = :ts, is_dirty = 1
+       WHERE id = :utang_id AND account_id = :account_id AND store_id = :store_id`,
+      {
+        ":amount": amount,
+        ":ts": ts,
+        ":utang_id": utangRef.id,
+        ...scopeParams(scope),
+      }
     );
   });
   return String(paymentId);
 }
 
-// ─── Pabili Orders ─────────────────────────────────────────────────────────
+// Pabili orders
 export async function getPabiliOrders(): Promise<PabiliOrder[]> {
   await getDb();
-  const rows = await queryAll<any>("SELECT * FROM pabili_orders ORDER BY timestamp DESC");
+  const scope = requireScope();
+  const rows = await queryAll<any>(
+    "SELECT * FROM pabili_orders WHERE account_id = :account_id AND store_id = :store_id ORDER BY timestamp DESC",
+    scopeParams(scope)
+  );
   return rows.map(row => ({
     id: String(row.id),
     customerName: row.customer_name || "Customer",
@@ -418,13 +581,18 @@ export async function getPabiliOrders(): Promise<PabiliOrder[]> {
 
 export async function createPabiliOrder(order: Omit<PabiliOrder, "id" | "date"> & { id?: string }) {
   await getDb();
+  const scope = requireScope();
   const id = toNumericId(order.id);
   const ts = order.timestamp ? new Date(order.timestamp).getTime() : now();
   await run(
-    `INSERT INTO pabili_orders (id, items_json, customer_name, customer_phone, status, timestamp, note, total, updated_at, is_dirty)
-     VALUES (:id, :items_json, :customer_name, :customer_phone, :status, :timestamp, :note, :total, :ts, 1)`,
+    `INSERT INTO pabili_orders (
+      id, account_id, store_id, items_json, customer_name, customer_phone, status, timestamp, note, total, updated_at, is_dirty
+    ) VALUES (
+      :id, :account_id, :store_id, :items_json, :customer_name, :customer_phone, :status, :timestamp, :note, :total, :ts, 1
+    )`,
     {
       ":id": id,
+      ...scopeParams(scope),
       ":items_json": JSON.stringify(order.items || []),
       ":customer_name": order.customerName || "Customer",
       ":customer_phone": order.customerPhone || "",
@@ -440,16 +608,28 @@ export async function createPabiliOrder(order: Omit<PabiliOrder, "id" | "date"> 
 
 export async function updatePabiliStatus(id: string, status: PabiliOrder["status"]) {
   await getDb();
+  const scope = requireScope();
   await run(
-    `UPDATE pabili_orders SET status = :status, updated_at = :ts, is_dirty = 1 WHERE id = :id`,
-    { ":status": status, ":ts": now(), ":id": toNumericId(id) }
+    `UPDATE pabili_orders
+     SET status = :status, updated_at = :ts, is_dirty = 1
+     WHERE id = :id AND account_id = :account_id AND store_id = :store_id`,
+    {
+      ":status": status,
+      ":ts": now(),
+      ":id": toNumericId(id),
+      ...scopeParams(scope),
+    }
   );
 }
 
-// ─── Expenses ──────────────────────────────────────────────────────────────
+// Expenses
 export async function getExpenses(): Promise<Expense[]> {
   await getDb();
-  const rows = await queryAll<any>("SELECT * FROM expenses ORDER BY date DESC");
+  const scope = requireScope();
+  const rows = await queryAll<any>(
+    "SELECT * FROM expenses WHERE account_id = :account_id AND store_id = :store_id ORDER BY date DESC",
+    scopeParams(scope)
+  );
   return rows.map(row => ({
     id: String(row.id),
     date: row.date,
@@ -462,12 +642,17 @@ export async function getExpenses(): Promise<Expense[]> {
 
 export async function addExpense(expense: Omit<Expense, "id"> & { id?: string }) {
   await getDb();
+  const scope = requireScope();
   const id = toNumericId(expense.id);
   await run(
-    `INSERT INTO expenses (id, name, amount, date, category, description, updated_at, is_dirty)
-     VALUES (:id, :name, :amount, :date, :category, :description, :ts, 1)`,
+    `INSERT INTO expenses (
+      id, account_id, store_id, name, amount, date, category, description, updated_at, is_dirty
+    ) VALUES (
+      :id, :account_id, :store_id, :name, :amount, :date, :category, :description, :ts, 1
+    )`,
     {
       ":id": id,
+      ...scopeParams(scope),
       ":name": expense.name,
       ":amount": expense.amount,
       ":date": expense.date,
@@ -479,103 +664,168 @@ export async function addExpense(expense: Omit<Expense, "id"> & { id?: string })
   return String(id);
 }
 
-// ─── Settings ──────────────────────────────────────────────────────────────
+// Settings
 export async function getSettings(): Promise<StoreSettings | null> {
   await getDb();
-  const row = await queryOne<any>("SELECT * FROM settings WHERE id = 1");
-  if (!row) return null;
+  const scope = requireScope();
+  const account = await queryOne<any>("SELECT * FROM accounts WHERE id = :account_id LIMIT 1", {
+    ":account_id": scope.accountId,
+  });
+  const store = await queryOne<any>(
+    "SELECT * FROM stores WHERE id = :store_id AND account_id = :account_id LIMIT 1",
+    scopeParams(scope)
+  );
+  if (!account || !store) return null;
+
+  const row = await queryOne<any>(
+    "SELECT * FROM store_settings WHERE store_id = :store_id LIMIT 1",
+    { ":store_id": scope.storeId }
+  );
+
   return {
-    storeName: row.store_name || "My Sari-Sari Store",
-    ownerName: row.owner_name || "",
-    address: row.address || "",
-    theme: (row.theme || "light") as StoreSettings["theme"],
-    language: (row.language || "en") as StoreSettings["language"],
-    subscription: (row.subscription_tier || "free") as StoreSettings["subscription"],
-    gcashNumber: row.gcash_number || "",
-    paymayaNumber: row.paymaya_number || "",
-    managementPIN: row.management_pin || "0000",
-    isOnboardingComplete: !!row.onboarding_complete,
-    enableUtang: row.enable_utang !== 0,
-    enablePabili: row.enable_pabili !== 0,
-    enableBarcodeScanner: row.enable_barcode_scanner !== 0,
-    enableReceiptPrinter: row.enable_receipt_printer !== 0,
+    storeName: store.store_name || "My Sari-Sari Store",
+    ownerName: account.owner_name || "",
+    address: row?.address || "",
+    theme: (row?.theme || "light") as StoreSettings["theme"],
+    language: (row?.language || "fil") as StoreSettings["language"],
+    subscription: (store.subscription_tier || "free") as StoreSettings["subscription"],
+    gcashNumber: row?.gcash_number || "",
+    paymayaNumber: row?.maya_number || "",
+    managementPIN: "",
+    hasManagementPin: !!row?.management_pin_hash,
+    isOnboardingComplete: Number(row?.onboarding_complete || 0) === 1,
+    enableUtang: Number(row?.utang_enabled ?? 1) === 1,
+    enablePabili: Number(row?.pabili_enabled ?? 1) === 1,
+    enableBarcodeScanner: Number(row?.enable_barcode_scanner ?? 1) === 1,
+    enableReceiptPrinter: Number(row?.enable_receipt_printer ?? 0) === 1,
   };
 }
 
 export async function saveSettings(settings: StoreSettings) {
   await getDb();
-  await run(
-    `INSERT INTO settings (id, store_name, owner_name, address, theme, language, subscription_tier, gcash_number, paymaya_number, management_pin,
-      onboarding_complete, enable_utang, enable_pabili, enable_barcode_scanner, enable_receipt_printer, updated_at, is_dirty)
-     VALUES (1, :store_name, :owner_name, :address, :theme, :language, :subscription_tier, :gcash_number, :paymaya_number, :management_pin,
-      :onboarding_complete, :enable_utang, :enable_pabili, :enable_barcode_scanner, :enable_receipt_printer, :ts, 1)
-     ON CONFLICT(id) DO UPDATE SET
-      store_name = excluded.store_name,
-      owner_name = excluded.owner_name,
-      address = excluded.address,
-      theme = excluded.theme,
-      language = excluded.language,
-      subscription_tier = excluded.subscription_tier,
-      gcash_number = excluded.gcash_number,
-      paymaya_number = excluded.paymaya_number,
-      management_pin = excluded.management_pin,
-      onboarding_complete = excluded.onboarding_complete,
-      enable_utang = excluded.enable_utang,
-      enable_pabili = excluded.enable_pabili,
-      enable_barcode_scanner = excluded.enable_barcode_scanner,
-      enable_receipt_printer = excluded.enable_receipt_printer,
-      updated_at = excluded.updated_at,
-      is_dirty = 1`,
-    {
-      ":store_name": settings.storeName,
-      ":owner_name": settings.ownerName,
-      ":address": settings.address,
-      ":theme": settings.theme,
-      ":language": settings.language,
-      ":subscription_tier": settings.subscription,
-      ":gcash_number": settings.gcashNumber,
-      ":paymaya_number": settings.paymayaNumber,
-      ":management_pin": settings.managementPIN,
-      ":onboarding_complete": settings.isOnboardingComplete ? 1 : 0,
-      ":enable_utang": settings.enableUtang ? 1 : 0,
-      ":enable_pabili": settings.enablePabili ? 1 : 0,
-      ":enable_barcode_scanner": settings.enableBarcodeScanner ? 1 : 0,
-      ":enable_receipt_printer": settings.enableReceiptPrinter ? 1 : 0,
-      ":ts": now(),
-    }
-  );
+  const scope = requireScope();
+  const ts = now();
+  const settingsId = `stg_${scope.storeId}`;
+
+  await runTransaction(db => {
+    db.run(
+      `UPDATE accounts
+       SET owner_name = :owner_name, updated_at = :ts, is_dirty = 1
+       WHERE id = :account_id`,
+      {
+        ":owner_name": settings.ownerName,
+        ":ts": ts,
+        ":account_id": scope.accountId,
+      }
+    );
+
+    db.run(
+      `UPDATE stores
+       SET store_name = :store_name, subscription_tier = :subscription_tier, updated_at = :ts, is_dirty = 1
+       WHERE id = :store_id AND account_id = :account_id`,
+      {
+        ":store_name": settings.storeName,
+        ":subscription_tier": settings.subscription,
+        ":ts": ts,
+        ...scopeParams(scope),
+      }
+    );
+
+    db.run(
+      `INSERT INTO store_settings (
+        id, store_id, management_pin_hash, language, theme, utang_enabled, pabili_enabled,
+        gcash_number, maya_number, address, onboarding_complete, enable_barcode_scanner,
+        enable_receipt_printer, updated_at, is_dirty
+      ) VALUES (
+        :id, :store_id,
+        (SELECT management_pin_hash FROM store_settings WHERE store_id = :store_id),
+        :language, :theme, :utang_enabled, :pabili_enabled,
+        :gcash_number, :maya_number, :address, :onboarding_complete, :enable_barcode_scanner,
+        :enable_receipt_printer, :updated_at, 1
+      )
+      ON CONFLICT(store_id) DO UPDATE SET
+        language = excluded.language,
+        theme = excluded.theme,
+        utang_enabled = excluded.utang_enabled,
+        pabili_enabled = excluded.pabili_enabled,
+        gcash_number = excluded.gcash_number,
+        maya_number = excluded.maya_number,
+        address = excluded.address,
+        onboarding_complete = excluded.onboarding_complete,
+        enable_barcode_scanner = excluded.enable_barcode_scanner,
+        enable_receipt_printer = excluded.enable_receipt_printer,
+        updated_at = excluded.updated_at,
+        is_dirty = 1`,
+      {
+        ":id": settingsId,
+        ":store_id": scope.storeId,
+        ":language": settings.language,
+        ":theme": settings.theme,
+        ":utang_enabled": settings.enableUtang ? 1 : 0,
+        ":pabili_enabled": settings.enablePabili ? 1 : 0,
+        ":gcash_number": settings.gcashNumber,
+        ":maya_number": settings.paymayaNumber,
+        ":address": settings.address,
+        ":onboarding_complete": settings.isOnboardingComplete ? 1 : 0,
+        ":enable_barcode_scanner": settings.enableBarcodeScanner ? 1 : 0,
+        ":enable_receipt_printer": settings.enableReceiptPrinter ? 1 : 0,
+        ":updated_at": ts,
+      }
+    );
+  });
 }
 
-// ─── Sync helpers (optional for Supabase sync layer) ───────────────────────
+// Sync helpers
 export async function getDirtyRows(table: Table) {
   await getDb();
-  return queryAll<any>(`SELECT * FROM ${table} WHERE is_dirty = 1`);
+  const scope = currentScope;
+  if (!scope) return [];
+  const filter = scopeFilterForTable(table, scope);
+  return queryAll<any>(
+    `SELECT * FROM ${table} WHERE is_dirty = 1 AND ${filter.clause}`,
+    filter.params
+  );
 }
 
 export async function markSynced(table: Table, ids: string[]) {
   await getDb();
-  if (!ids.length) return;
+  const scope = currentScope;
+  if (!scope || !ids.length) return;
   const placeholders = ids.map((_, idx) => `:id${idx}`).join(", ");
-  const params = ids.reduce<Record<string, any>>((acc, id, idx) => {
+  const idParams = ids.reduce<Record<string, any>>((acc, id, idx) => {
     acc[`:id${idx}`] = id;
     return acc;
   }, {});
-  await run(`UPDATE ${table} SET is_dirty = 0 WHERE id IN (${placeholders})`, params);
+  const filter = scopeFilterForTable(table, scope);
+  await run(
+    `UPDATE ${table} SET is_dirty = 0 WHERE id IN (${placeholders}) AND ${filter.clause}`,
+    { ...idParams, ...filter.params }
+  );
 }
 
 export async function upsertRemote(table: Table, rows: any[]) {
   await getDb();
-  if (!rows.length) return;
+  const scope = currentScope;
+  if (!scope || !rows.length) return;
+  const scopedRows = rows.filter(row => rowMatchesScope(table, row, scope));
+  if (!scopedRows.length) return;
   await runTransaction(db => {
-    rows.forEach(row => {
+    scopedRows.forEach(row => {
       const cols = Object.keys(row);
+      if (!cols.length) return;
       const placeholders = cols.map(c => `:${c}`).join(", ");
-      const updates = cols.filter(c => c !== "id").map(c => `${c} = excluded.${c}`).join(", ");
+      const conflictTarget = table === "store_settings" ? "store_id" : "id";
+      const updates = cols
+        .filter(c => c !== conflictTarget)
+        .map(c => `${c} = excluded.${c}`)
+        .join(", ");
       const params: Record<string, any> = {};
-      cols.forEach(c => { params[`:${c}`] = row[c]; });
+      cols.forEach(c => {
+        params[`:${c}`] = row[c];
+      });
       db.run(
         `INSERT INTO ${table} (${cols.join(", ")}) VALUES (${placeholders})
-         ON CONFLICT(id) DO UPDATE SET ${updates}`,
+         ON CONFLICT(${conflictTarget}) DO UPDATE SET ${updates}`,
         params
       );
     });
@@ -584,7 +834,13 @@ export async function upsertRemote(table: Table, rows: any[]) {
 
 export async function latestUpdate(table: Table) {
   await getDb();
-  const row = await queryOne<{ max_ts: number }>(`SELECT MAX(updated_at) as max_ts FROM ${table}`);
+  const scope = currentScope;
+  if (!scope) return 0;
+  const filter = scopeFilterForTable(table, scope);
+  const row = await queryOne<{ max_ts: number }>(
+    `SELECT MAX(updated_at) as max_ts FROM ${table} WHERE ${filter.clause}`,
+    filter.params
+  );
   return row?.max_ts || 0;
 }
 

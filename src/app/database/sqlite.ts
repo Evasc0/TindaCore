@@ -11,8 +11,59 @@ type QueryExecResult = { columns: string[]; values: any[][] };
 
 const schemaStatements = [
   "PRAGMA foreign_keys = ON;",
+  `CREATE TABLE IF NOT EXISTS accounts (
+    id TEXT PRIMARY KEY,
+    owner_name TEXT,
+    email TEXT,
+    mobile TEXT,
+    password_hash TEXT NOT NULL,
+    supabase_user_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
+    is_dirty INTEGER DEFAULT 0
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email);`,
+  `CREATE INDEX IF NOT EXISTS idx_accounts_mobile ON accounts(mobile);`,
+  `CREATE TABLE IF NOT EXISTS stores (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    store_name TEXT NOT NULL,
+    subscription_tier TEXT DEFAULT 'free',
+    created_at TEXT NOT NULL,
+    updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
+    is_dirty INTEGER DEFAULT 0
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_stores_account ON stores(account_id);`,
+  `CREATE TABLE IF NOT EXISTS store_settings (
+    id TEXT PRIMARY KEY,
+    store_id TEXT NOT NULL UNIQUE,
+    management_pin_hash TEXT,
+    language TEXT DEFAULT 'fil',
+    theme TEXT DEFAULT 'light',
+    utang_enabled INTEGER DEFAULT 1,
+    pabili_enabled INTEGER DEFAULT 1,
+    gcash_number TEXT,
+    maya_number TEXT,
+    address TEXT,
+    onboarding_complete INTEGER DEFAULT 0,
+    enable_barcode_scanner INTEGER DEFAULT 1,
+    enable_receipt_printer INTEGER DEFAULT 0,
+    updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
+    is_dirty INTEGER DEFAULT 0
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_store_settings_store ON store_settings(store_id);`,
+  `CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    store_id TEXT NOT NULL,
+    is_active INTEGER DEFAULT 1,
+    login_at TEXT NOT NULL
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(is_active, login_at);`,
   `CREATE TABLE IF NOT EXISTS products (
     id INTEGER PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    store_id TEXT NOT NULL,
     name TEXT NOT NULL,
     barcode TEXT,
     price REAL NOT NULL,
@@ -27,8 +78,11 @@ const schemaStatements = [
     updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
     is_dirty INTEGER DEFAULT 0
   );`,
+  `CREATE INDEX IF NOT EXISTS idx_products_scope ON products(account_id, store_id);`,
   `CREATE TABLE IF NOT EXISTS sales (
     id INTEGER PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    store_id TEXT NOT NULL,
     total REAL NOT NULL,
     payment_type TEXT NOT NULL,
     timestamp INTEGER NOT NULL,
@@ -39,8 +93,11 @@ const schemaStatements = [
     updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
     is_dirty INTEGER DEFAULT 0
   );`,
+  `CREATE INDEX IF NOT EXISTS idx_sales_scope ON sales(account_id, store_id);`,
   `CREATE TABLE IF NOT EXISTS sale_items (
     id INTEGER PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    store_id TEXT NOT NULL,
     sale_id INTEGER NOT NULL,
     product_id INTEGER,
     name TEXT,
@@ -53,15 +110,21 @@ const schemaStatements = [
     is_dirty INTEGER DEFAULT 0,
     FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE
   );`,
+  `CREATE INDEX IF NOT EXISTS idx_sale_items_scope ON sale_items(account_id, store_id);`,
   `CREATE TABLE IF NOT EXISTS customers (
     id INTEGER PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    store_id TEXT NOT NULL,
     name TEXT NOT NULL,
     phone TEXT,
     updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
     is_dirty INTEGER DEFAULT 0
   );`,
+  `CREATE INDEX IF NOT EXISTS idx_customers_scope ON customers(account_id, store_id);`,
   `CREATE TABLE IF NOT EXISTS utang_records (
     id INTEGER PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    store_id TEXT NOT NULL,
     customer_id INTEGER NOT NULL,
     amount REAL NOT NULL,
     balance REAL NOT NULL,
@@ -71,8 +134,11 @@ const schemaStatements = [
     is_dirty INTEGER DEFAULT 0,
     FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
   );`,
+  `CREATE INDEX IF NOT EXISTS idx_utang_records_scope ON utang_records(account_id, store_id);`,
   `CREATE TABLE IF NOT EXISTS utang_payments (
     id INTEGER PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    store_id TEXT NOT NULL,
     utang_id INTEGER NOT NULL,
     amount REAL NOT NULL,
     date TEXT NOT NULL,
@@ -80,8 +146,11 @@ const schemaStatements = [
     is_dirty INTEGER DEFAULT 0,
     FOREIGN KEY (utang_id) REFERENCES utang_records(id) ON DELETE CASCADE
   );`,
+  `CREATE INDEX IF NOT EXISTS idx_utang_payments_scope ON utang_payments(account_id, store_id);`,
   `CREATE TABLE IF NOT EXISTS pabili_orders (
     id INTEGER PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    store_id TEXT NOT NULL,
     items_json TEXT NOT NULL,
     customer_name TEXT,
     customer_phone TEXT,
@@ -92,8 +161,11 @@ const schemaStatements = [
     updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
     is_dirty INTEGER DEFAULT 0
   );`,
+  `CREATE INDEX IF NOT EXISTS idx_pabili_orders_scope ON pabili_orders(account_id, store_id);`,
   `CREATE TABLE IF NOT EXISTS expenses (
     id INTEGER PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    store_id TEXT NOT NULL,
     name TEXT NOT NULL,
     amount REAL NOT NULL,
     date TEXT NOT NULL,
@@ -102,29 +174,32 @@ const schemaStatements = [
     updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
     is_dirty INTEGER DEFAULT 0
   );`,
-  `CREATE TABLE IF NOT EXISTS settings (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    store_name TEXT,
-    owner_name TEXT,
-    subscription_tier TEXT,
-    address TEXT,
-    gcash_number TEXT,
-    paymaya_number TEXT,
-    theme TEXT,
-    language TEXT,
-    management_pin TEXT,
-    onboarding_complete INTEGER DEFAULT 0,
-    enable_utang INTEGER DEFAULT 1,
-    enable_pabili INTEGER DEFAULT 1,
-    enable_barcode_scanner INTEGER DEFAULT 1,
-    enable_receipt_printer INTEGER DEFAULT 0,
-    updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
-    is_dirty INTEGER DEFAULT 0
-  );`,
+  `CREATE INDEX IF NOT EXISTS idx_expenses_scope ON expenses(account_id, store_id);`,
   `CREATE TABLE IF NOT EXISTS sync_state (
     table_name TEXT PRIMARY KEY,
     last_synced_at INTEGER DEFAULT 0
   );`,
+];
+
+type ColumnMigration = { table: string; column: string; definition: string };
+
+const columnMigrations: ColumnMigration[] = [
+  { table: "products", column: "account_id", definition: "TEXT" },
+  { table: "products", column: "store_id", definition: "TEXT" },
+  { table: "sales", column: "account_id", definition: "TEXT" },
+  { table: "sales", column: "store_id", definition: "TEXT" },
+  { table: "sale_items", column: "account_id", definition: "TEXT" },
+  { table: "sale_items", column: "store_id", definition: "TEXT" },
+  { table: "customers", column: "account_id", definition: "TEXT" },
+  { table: "customers", column: "store_id", definition: "TEXT" },
+  { table: "utang_records", column: "account_id", definition: "TEXT" },
+  { table: "utang_records", column: "store_id", definition: "TEXT" },
+  { table: "utang_payments", column: "account_id", definition: "TEXT" },
+  { table: "utang_payments", column: "store_id", definition: "TEXT" },
+  { table: "pabili_orders", column: "account_id", definition: "TEXT" },
+  { table: "pabili_orders", column: "store_id", definition: "TEXT" },
+  { table: "expenses", column: "account_id", definition: "TEXT" },
+  { table: "expenses", column: "store_id", definition: "TEXT" },
 ];
 
 const toBase64 = (buffer: Uint8Array) => {
@@ -158,7 +233,18 @@ function mapResult(result: QueryExecResult[]): any[] {
 }
 
 function createTables(db: Database) {
-  schemaStatements.forEach(sql => db.exec(sql));
+  const indexStatements = schemaStatements.filter(sql => sql.trim().toUpperCase().startsWith("CREATE INDEX"));
+  const baseStatements = schemaStatements.filter(sql => !sql.trim().toUpperCase().startsWith("CREATE INDEX"));
+
+  baseStatements.forEach(sql => db.exec(sql));
+  columnMigrations.forEach(migration => {
+    const info = db.exec(`PRAGMA table_info(${migration.table});`);
+    const columns = info[0]?.values?.map(row => String(row[1])) || [];
+    if (!columns.includes(migration.column)) {
+      db.exec(`ALTER TABLE ${migration.table} ADD COLUMN ${migration.column} ${migration.definition};`);
+    }
+  });
+  indexStatements.forEach(sql => db.exec(sql));
 }
 
 async function schedulePersist(db: Database) {
