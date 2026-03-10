@@ -1,6 +1,6 @@
 import React, { useState, useRef } from "react";
 import { useNavigate } from "react-router";
-import { Scan, Plus, Minus, Trash2, X, CheckCircle, Zap } from "lucide-react";
+import { Scan, Plus, Minus, Trash2, X, CheckCircle, Zap, Search } from "lucide-react";
 import { useStore } from "../context/StoreContext";
 
 type Mode = "cart" | "complete" | "utang_select";
@@ -18,10 +18,27 @@ export function POSScreen() {
   const [selectedCartItem, setSelectedCartItem] = useState<string | null>(null);
   const [scanFlash, setScanFlash] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState<"cash" | "gcash" | "paymaya">("cash");
+  const [searchTerm, setSearchTerm] = useState("");
   const barcodeRef = useRef<HTMLInputElement>(null);
 
   const quickItems = products.filter(p => p.isQuickItem);
   const change = parseFloat(paymentInput || "0") - cartTotal;
+  const searchResults = searchTerm.trim()
+    ? products.filter(p =>
+        p.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        (p.barcode || "").includes(searchTerm)
+      ).slice(0, 8)
+    : [];
+  const displayStock = (p: any) => {
+    const factor =
+      p.unit === "pack" || p.unit === "box"
+        ? p.conversion || 1
+        : p.unit === "kg" || p.unit === "liters"
+        ? 1000
+        : 1;
+    const qty = (p.stock || 0) / factor;
+    return p.unit === "kg" || p.unit === "liters" ? qty.toFixed(2) : Math.floor(qty);
+  };
 
   const card = isDark ? "#1f2937" : "#ffffff";
   const cardBorder = isDark ? "#374151" : "#f3f4f6";
@@ -88,7 +105,7 @@ export function POSScreen() {
 
         <div className="flex-1 overflow-y-auto p-4">
           {customers.map(c => {
-            const bal = c.transactions.filter(tx => !tx.paid).reduce((s, tx) => s + tx.total, 0);
+            const bal = c.transactions.filter(tx => tx.balance > 0).reduce((s, tx) => s + tx.balance, 0);
             return (
               <button
                 key={c.id}
@@ -335,17 +352,17 @@ export function POSScreen() {
             <button
               key={product.id}
               onClick={() => addToCart(product.id)}
-              disabled={product.stock === 0}
+              disabled={displayStock(product) === 0}
               className="flex-shrink-0 flex flex-col items-center gap-0.5 px-2.5 py-2 rounded-2xl border-2 transition-all active:scale-95 relative"
               style={{
                 minWidth: "64px",
-                background: product.stock === 0
+                background: displayStock(product) === 0
                   ? (isDark ? "#1f2937" : "#f9fafb")
                   : (isDark ? "#1e3a8a" : "#eff6ff"),
-                borderColor: product.stock === 0
+                borderColor: displayStock(product) === 0
                   ? (isDark ? "#374151" : "#e5e7eb")
                   : (isDark ? "#3b82f6" : "#bfdbfe"),
-                opacity: product.stock === 0 ? 0.45 : 1,
+                opacity: displayStock(product) === 0 ? 0.45 : 1,
               }}
             >
               <span className="text-lg leading-none">{product.emoji}</span>
@@ -377,7 +394,53 @@ export function POSScreen() {
               )}
             </button>
           ))}
+      </div>
+    </div>
+
+      {/* Product search */}
+      <div className="flex-shrink-0 px-4 py-2" style={{ background: bg }}>
+        <div
+          className="rounded-2xl flex items-center gap-3 px-4 py-3 border"
+          style={{ background: card, borderColor: cardBorder }}
+        >
+          <Search size={16} style={{ color: textMuted }} />
+          <input
+            type="text"
+            value={searchTerm}
+            onChange={e => setSearchTerm(e.target.value)}
+            placeholder={t.searchProduct}
+            className="flex-1 outline-none text-sm"
+            style={{ background: "transparent", color: text }}
+          />
+          {searchTerm && (
+            <button onClick={() => setSearchTerm("")} className="text-xs font-semibold" style={{ color: textMuted }}>Clear</button>
+          )}
         </div>
+        {searchTerm && (
+          <div className="mt-2 space-y-2" style={{ maxHeight: "160px", overflowY: "auto" }}>
+            {searchResults.length === 0 ? (
+              <p className="text-xs px-2" style={{ color: textMuted }}>No products found</p>
+            ) : (
+              searchResults.map(p => (
+                <button
+                  key={p.id}
+                  onClick={() => addToCart(p.id)}
+                  className="w-full flex items-center justify-between px-3 py-2 rounded-xl border text-left"
+                  style={{ background: card, borderColor: cardBorder }}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="text-lg">{p.emoji}</span>
+                    <div>
+                      <p className="text-sm font-semibold" style={{ color: text }}>{p.name}</p>
+                      <p className="text-xs" style={{ color: textMuted }}>₱{p.price} · {displayStock(p)} stock</p>
+                    </div>
+                  </div>
+                  <span className="text-xs font-bold px-2 py-1 rounded-full" style={{ background: isDark ? "#1e3a8a" : "#eff6ff", color: "#2563eb" }}>Add</span>
+                </button>
+              ))
+            )}
+          </div>
+        )}
       </div>
 
       {/* ── SCROLLABLE CART ── */}

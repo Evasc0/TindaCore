@@ -30,13 +30,24 @@ export function ManagementDashboard() {
   const text = isDark ? "#f9fafb" : "#111827";
   const textMuted = isDark ? "#9ca3af" : "#6b7280";
 
+  const sellingStock = (p: any) => {
+    const factor =
+      p.unit === "pack" || p.unit === "box"
+        ? p.conversion || 1
+        : p.unit === "kg" || p.unit === "liters"
+        ? 1000
+        : 1;
+    const qty = (p.stock || 0) / factor;
+    return p.unit === "kg" || p.unit === "liters" ? parseFloat(qty.toFixed(2)) : Math.floor(qty);
+  };
+
   const todayStr = new Date().toISOString().split("T")[0];
   const todaySales = sales.filter(s => s.date.startsWith(todayStr));
   const totalToday = todaySales.reduce((sum, s) => sum + s.total, 0);
   const weeklyRevenue = getWeeklyRevenue();
   const weeklyProfit = getWeeklyProfit();
-  const lowStockCount = products.filter(p => p.stock > 0 && p.stock <= 5).length;
-  const outOfStockCount = products.filter(p => p.stock === 0).length;
+  const lowStockCount = products.filter(p => sellingStock(p) > 0 && sellingStock(p) <= 5).length;
+  const outOfStockCount = products.filter(p => sellingStock(p) === 0).length;
   const totalUtang = customers.reduce((sum, c) => sum + getCustomerBalance(c.id), 0);
   const restockSuggestions = getSmartRestockSuggestions();
 

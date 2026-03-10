@@ -84,6 +84,7 @@ export function FinancialScreen() {
     if (!expDesc || !expAmount) return;
     addExpense({
       date: new Date().toISOString().split("T")[0],
+      name: expDesc,
       description: expDesc,
       amount: parseFloat(expAmount),
       category: expCategory,
@@ -300,7 +301,7 @@ export function FinancialScreen() {
             filteredExpenses.map(exp => (
               <div key={exp.id} className="flex justify-between items-center px-4 py-3 border-b last:border-0" style={{ borderColor: cardBorder }}>
                 <div>
-                  <p className="text-sm font-medium" style={{ color: text }}>{exp.description}</p>
+                  <p className="text-sm font-medium" style={{ color: text }}>{exp.name || exp.description}</p>
                   <p className="text-xs" style={{ color: textMuted }}>{exp.category} · {exp.date}</p>
                 </div>
                 <p className="font-bold text-red-500 text-sm">-₱{exp.amount.toFixed(2)}</p>

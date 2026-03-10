@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { useNavigate } from "react-router";
 import { Search, Plus, AlertTriangle, Package } from "lucide-react";
-import { useStore } from "../context/StoreContext";
+import { useStore, Product } from "../context/StoreContext";
 
 const categories_en = ["All", "Beverages", "Noodles", "Canned Goods", "Sweets", "Bread", "Snacks", "Condiments"];
 const categories_fil = ["Lahat", "Beverages", "Noodles", "Canned Goods", "Sweets", "Bread", "Snacks", "Condiments"];
@@ -21,6 +21,17 @@ export function InventoryScreen() {
   const textMuted = isDark ? "#9ca3af" : "#6b7280";
   const inputBg = isDark ? "#374151" : "#ffffff";
 
+  const getSellingStock = (p: Product) => {
+    const factor =
+      p.unit === "pack" || p.unit === "box"
+        ? p.conversion || 1
+        : p.unit === "kg" || p.unit === "liters"
+        ? 1000
+        : 1;
+    const qty = (p.stock || 0) / factor;
+    return p.unit === "kg" || p.unit === "liters" ? parseFloat(qty.toFixed(2)) : Math.floor(qty);
+  };
+
   const categories = settings.language === "fil" ? categories_fil : categories_en;
   const allLabel = settings.language === "fil" ? "Lahat" : "All";
 
@@ -31,8 +42,11 @@ export function InventoryScreen() {
   });
 
   const totalProducts = products.length;
-  const lowStock = products.filter(p => p.stock > 0 && p.stock <= 5).length;
-  const outOfStock = products.filter(p => p.stock === 0).length;
+  const lowStock = products.filter(p => {
+    const qty = getSellingStock(p);
+    return qty > 0 && qty <= 5;
+  }).length;
+  const outOfStock = products.filter(p => getSellingStock(p) === 0).length;
 
   const getStockStyle = (stock: number) => {
     if (stock === 0) return { bg: isDark ? "#450a0a" : "#fef2f2", text: "#ef4444", border: isDark ? "#7f1d1d" : "#fecaca" };
@@ -130,7 +144,7 @@ export function InventoryScreen() {
           </div>
         ) : (
           filtered.map(product => {
-            const stockStyle = getStockStyle(product.stock);
+            const stockStyle = getStockStyle(getSellingStock(product));
             return (
               <button
                 key={product.id}
@@ -165,9 +179,9 @@ export function InventoryScreen() {
                     className="text-xs px-2 py-0.5 rounded-full font-semibold border"
                     style={{ background: stockStyle.bg, color: stockStyle.text, borderColor: stockStyle.border }}
                   >
-                    {product.stock === 0
+                    {getSellingStock(product) === 0
                       ? t.none
-                      : `${product.stock} ${t.remaining}`}
+                      : `${getSellingStock(product)} ${t.remaining}`}
                   </span>
                 </div>
               </button>

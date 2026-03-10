@@ -4,7 +4,7 @@ import {
   ShoppingCart, Scan, Search, Bell, Users, Shield,
   AlertTriangle, TrendingUp, ChevronRight, X, Package, User
 } from "lucide-react";
-import { useStore } from "../context/StoreContext";
+import { useStore, Product } from "../context/StoreContext";
 
 export function HomeScreen() {
   const navigate = useNavigate();
@@ -26,12 +26,23 @@ export function HomeScreen() {
   const text = isDark ? "#f9fafb" : "#111827";
   const textMuted = isDark ? "#9ca3af" : "#6b7280";
 
+  const sellingStock = (p: Product) => {
+    const factor =
+      p.unit === "pack" || p.unit === "box"
+        ? p.conversion || 1
+        : p.unit === "kg" || p.unit === "liters"
+        ? 1000
+        : 1;
+    const qty = (p.stock || 0) / factor;
+    return p.unit === "kg" || p.unit === "liters" ? parseFloat(qty.toFixed(2)) : Math.floor(qty);
+  };
+
   const todayStr = new Date().toISOString().split("T")[0];
   const todaySales = sales.filter(s => s.date.startsWith(todayStr));
   const totalToday = todaySales.reduce((sum, s) => sum + s.total, 0);
   const pendingPabili = pabiliOrders.filter(o => o.status === "pending").length;
-  const lowStockProducts = products.filter(p => p.stock > 0 && p.stock <= 5);
-  const outOfStockProducts = products.filter(p => p.stock === 0);
+  const lowStockProducts = products.filter(p => sellingStock(p) > 0 && sellingStock(p) <= 5);
+  const outOfStockProducts = products.filter(p => sellingStock(p) === 0);
   const totalUtang = customers.reduce((sum, c) => sum + getCustomerBalance(c.id), 0);
 
   const now = new Date();
@@ -117,7 +128,7 @@ export function HomeScreen() {
                     <p className="font-semibold text-sm" style={{ color: text }}>{p.name}</p>
                     <p className="text-xs" style={{ color: textMuted }}>
                       {p.category} •
-                      <span style={{ color: p.stock <= 5 ? "#f97316" : "#16a34a" }}> {p.stock} left</span>
+                      <span style={{ color: sellingStock(p) <= 5 ? "#f97316" : "#16a34a" }}> {sellingStock(p)} left</span>
                     </p>
                   </div>
                   <div className="text-right">
@@ -316,7 +327,7 @@ export function HomeScreen() {
               ))}
               {lowStockProducts.slice(0, 3).map(p => (
                 <p key={p.id} className="text-xs" style={{ color: isDark ? "#fbbf24" : "#92400e" }}>
-                  🟡 {p.name} — {p.stock} left
+                  🟡 {p.name} — {sellingStock(p)} left
                 </p>
               ))}
             </div>

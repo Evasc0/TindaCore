@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { useNavigate } from "react-router";
 import { RefreshCw, Check, Share2, ArrowLeft, Package, ShoppingCart, AlertTriangle, Download, MessageSquare, Printer } from "lucide-react";
-import { useStore, canAccess, RestockItem } from "../context/StoreContext";
+import { useStore, canAccess, RestockItem, Product } from "../context/StoreContext";
 import { TierBadge, TierGate, UpgradeBanner } from "./TierComponents";
 
 export function SmartRestockScreen() {
@@ -16,8 +16,19 @@ export function SmartRestockScreen() {
   const text = isDark ? "#f9fafb" : "#111827";
   const textMuted = isDark ? "#9ca3af" : "#6b7280";
 
+  const getSellingStock = (p: Product) => {
+    const factor =
+      p.unit === "pack" || p.unit === "box"
+        ? p.conversion || 1
+        : p.unit === "kg" || p.unit === "liters"
+        ? 1000
+        : 1;
+    const qty = (p.stock || 0) / factor;
+    return p.unit === "kg" || p.unit === "liters" ? parseFloat(qty.toFixed(2)) : Math.floor(qty);
+  };
+
   const suggestions = getSmartRestockSuggestions();
-  const shownSuggestions = canAccess(sub, "premium") ? suggestions : canAccess(sub, "plus") ? suggestions.slice(0, 3) : [];
+  const shownSuggestions = canAccess(sub, "premium") ? suggestions : [];
 
   const [editedQtys, setEditedQtys] = useState<Record<string, number>>(() =>
     Object.fromEntries(suggestions.map(s => [s.product.id, s.suggestedQty]))
@@ -77,7 +88,7 @@ export function SmartRestockScreen() {
     return { label: "OK", bg: isDark ? "#14532d" : "#f0fdf4", color: "#16a34a" };
   };
 
-  if (!canAccess(sub, "plus")) {
+  if (!canAccess(sub, "premium")) {
     return (
       <div className="flex flex-col h-full" style={{ background: bg }}>
         <div style={{ background: "linear-gradient(160deg, #14532d 0%, #166534 60%, #16a34a 100%)" }} className="px-4 pt-4 pb-6 flex-shrink-0">
@@ -89,8 +100,8 @@ export function SmartRestockScreen() {
           </div>
         </div>
         <div className="flex-1 p-4 flex flex-col gap-4">
-          <UpgradeBanner from="free" to="plus" />
-          <TierGate required="plus" featureName={t.smartRestock} />
+          <UpgradeBanner from={sub} to="premium" />
+          <TierGate required="premium" featureName={t.smartRestock} />
         </div>
       </div>
     );
@@ -108,7 +119,7 @@ export function SmartRestockScreen() {
             <h2 className="text-white font-bold" style={{ fontSize: "20px" }}>{t.smartRestock}</h2>
             <p className="text-green-300 text-xs mt-0.5">{t.restockDescription}</p>
           </div>
-          <TierBadge tier={canAccess(sub, "premium") ? "premium" : "plus"} size="sm" />
+          <TierBadge tier={sub} size="sm" />
         </div>
 
         <div className="flex gap-2">
@@ -154,7 +165,7 @@ export function SmartRestockScreen() {
             <>
               <p className="text-xs mb-3" style={{ color: textMuted }}>{t.restockDescription}</p>
               {shownSuggestions.map(s => {
-                const badge = getStockBadge(s.product.stock, s.avgDailySales);
+                const badge = getStockBadge(getSellingStock(s.product), s.avgDailySales);
                 const isInList = shoppingList.some(i => i.productId === s.product.id);
                 return (
                   <div key={s.product.id} className="rounded-2xl border mb-3 overflow-hidden" style={{ background: card, borderColor: cardBorder }}>
@@ -175,7 +186,7 @@ export function SmartRestockScreen() {
                       {/* Stats row */}
                       <div className="grid grid-cols-3 gap-2 my-3">
                         {[
-                          { label: "Current Stock", value: `${s.product.stock}`, accent: badge.color },
+                          { label: "Current Stock", value: `${getSellingStock(s.product)}`, accent: badge.color },
                           { label: t.avgDailySales, value: `${s.avgDailySales.toFixed(1)}/day`, accent: text },
                           { label: t.suggestedQty, value: `${editedQtys[s.product.id] || s.suggestedQty}`, accent: "#2563eb" },
                         ].map(({ label, value, accent }) => (

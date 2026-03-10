@@ -174,7 +174,7 @@ export function UpgradeBanner({ from, to }: { from: SubscriptionTier; to: Subscr
           Upgrade to {isPremium ? "Premium" : "Plus"}
         </p>
         <p className="text-white text-opacity-80 text-xs" style={{ opacity: 0.8 }}>
-          {isPremium ? "Unlock Smart Restock, Financials & Community" : "Unlock Smart Pabili & Analytics"}
+          {isPremium ? "Unlock Smart Restock & Financials" : "Unlock Analytics & Categories"}
         </p>
       </div>
       <span className="text-white font-bold text-xs px-2 py-1 rounded-lg" style={{ background: "rgba(255,255,255,0.2)" }}>

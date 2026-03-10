@@ -110,7 +110,7 @@ export function UtangScreen() {
             .sort((a, b) => getCustomerBalance(b.id) - getCustomerBalance(a.id))
             .map((customer, idx) => {
               const balance = getCustomerBalance(customer.id);
-              const pendingTx = customer.transactions.filter(tx => !tx.paid).length;
+              const pendingTx = customer.transactions.filter(tx => tx.balance > 0).length;
               const av = avatarColors[idx % avatarColors.length];
 
               return (

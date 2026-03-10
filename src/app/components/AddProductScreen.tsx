@@ -1,9 +1,9 @@
 import React, { useState } from "react";
 import { useNavigate, useParams } from "react-router";
 import { ArrowLeft, Scan, Save, Trash2, ToggleLeft, ToggleRight, Check } from "lucide-react";
-import { useStore, Product } from "../context/StoreContext";
+import { useStore, Product, Unit } from "../context/StoreContext";
 
-const categories = ["Beverages", "Noodles", "Canned Goods", "Sweets", "Bread", "Snacks", "Condiments", "Dairy", "Toiletries", "Others"];
+const categories = ["General", "Beverages", "Noodles", "Canned Goods", "Sweets", "Bread", "Snacks", "Condiments", "Dairy", "Toiletries", "Others"];
 const emojis = ["🥤", "🍜", "🐟", "🍬", "🍞", "☕", "🧂", "🥫", "🍟", "🥨", "🧃", "🍫", "🍭", "🧴", "📦", "🌾", "🧃", "🫙", "🛒", "💊"];
 
 export function AddProductScreen() {
@@ -16,7 +16,24 @@ export function AddProductScreen() {
 
   const [name, setName] = useState(existing?.name || "");
   const [price, setPrice] = useState(existing?.price?.toString() || "");
-  const [stock, setStock] = useState(existing?.stock?.toString() || "");
+  const [cost, setCost] = useState(existing?.cost?.toString() || "");
+  const initialUnit: Unit = (existing?.unit as Unit) || "piece";
+  const [unit, setUnit] = useState<Unit>(initialUnit);
+  const [conversion, setConversion] = useState(existing?.conversion?.toString() || "1");
+  const toSellingStock = (product?: Product) => {
+    if (!product) return "";
+    const factor =
+      product.unit === "pack" || product.unit === "box"
+        ? product.conversion || 1
+        : product.unit === "kg" || product.unit === "liters"
+        ? 1000
+        : 1;
+    const selling = (product.stock || 0) / factor;
+    return product.unit === "kg" || product.unit === "liters"
+      ? selling.toFixed(2)
+      : selling.toString();
+  };
+  const [stock, setStock] = useState(toSellingStock(existing));
   const [barcode, setBarcode] = useState(existing?.barcode || "");
   const [category, setCategory] = useState(existing?.category || categories[0]);
   const [isQuickItem, setIsQuickItem] = useState(existing?.isQuickItem ?? false);
@@ -30,15 +47,34 @@ export function AddProductScreen() {
   const text = isDark ? "#f9fafb" : "#111827";
   const textMuted = isDark ? "#9ca3af" : "#6b7280";
   const subCard = isDark ? "#374151" : "#f9fafb";
+  const canUseCategories = settings.subscription !== "free";
 
-  const isValid = name.trim() !== "" && price !== "" && parseFloat(price) > 0 && stock !== "";
+  const isValid = name.trim() !== "" && price !== "" && parseFloat(price) > 0 && stock !== "" &&
+    (!["pack", "box"].includes(unit) || parseFloat(conversion || "0") > 0);
 
   const handleSave = () => {
     if (!isValid) return;
+    const parsedStock = parseFloat(stock || "0");
+    const parsedPrice = parseFloat(price || "0");
+    const parsedCost = cost ? parseFloat(cost) : (existing?.cost || parsedPrice * 0.65);
+    const conv = ["pack", "box"].includes(unit) ? Math.max(1, parseFloat(conversion || "1")) : 1;
+    const baseUnit: "piece" | "grams" | "ml" = unit === "kg" || unit === "grams"
+      ? "grams"
+      : unit === "liters" || unit === "ml"
+      ? "ml"
+      : "piece";
     const productData = {
-      name: name.trim(), price: parseFloat(price), stock: parseInt(stock),
-      barcode: barcode.trim(), category, isQuickItem, emoji: selectedEmoji,
-      cost: existing?.cost || parseFloat(price) * 0.65,
+      name: name.trim(),
+      price: parsedPrice,
+      cost: parsedCost,
+      stock: parsedStock,
+      unit,
+      baseUnit,
+      conversion: conv,
+      barcode: barcode.trim(),
+      category,
+      isQuickItem,
+      emoji: selectedEmoji,
     };
     if (isEditing && id) updateProduct(id, productData);
     else addProduct(productData);
@@ -161,6 +197,65 @@ export function AddProductScreen() {
           </div>
         </div>
 
+        {/* Cost Price */}
+        <div className="rounded-2xl p-4 mb-3 border" style={{ background: card, borderColor: cardBorder }}>
+          <label className="text-xs font-semibold uppercase tracking-wider block mb-2" style={{ color: textMuted }}>
+            {t.costPrice} <span className="text-red-400">*</span>
+          </label>
+          <div className="flex items-center gap-1">
+            <span className="font-bold" style={{ color: textMuted }}>₱</span>
+            <input
+              type="number"
+              value={cost}
+              onChange={e => setCost(e.target.value)}
+              placeholder="0.00"
+              className="w-full outline-none font-bold"
+              style={{ fontSize: "18px", background: "transparent", color: text }}
+            />
+          </div>
+          <p className="text-xs mt-1" style={{ color: textMuted }}>
+            Used for COGS and profit calculations.
+          </p>
+        </div>
+
+        {/* Unit & Conversion */}
+        <div className="rounded-2xl p-4 mb-3 border" style={{ background: card, borderColor: cardBorder }}>
+          <label className="text-xs font-semibold uppercase tracking-wider block mb-3" style={{ color: textMuted }}>
+            Unit Type
+          </label>
+          <div className="flex flex-wrap gap-2 mb-3">
+            {(["piece", "pack", "box", "kg", "grams", "ml", "liters"] as Unit[]).map(u => (
+              <button
+                key={u}
+                onClick={() => setUnit(u)}
+                className="px-3 py-1.5 rounded-full text-xs font-semibold transition-all"
+                style={{
+                  background: unit === u ? "#16a34a" : subCard,
+                  color: unit === u ? "#ffffff" : textMuted,
+                  border: `1px solid ${unit === u ? "#16a34a" : cardBorder}`,
+                }}
+              >
+                {u}
+              </button>
+            ))}
+          </div>
+          {["pack", "box"].includes(unit) && (
+            <div>
+              <label className="text-xs font-semibold uppercase tracking-wider block mb-2" style={{ color: textMuted }}>
+                Pieces per {unit}
+              </label>
+              <input
+                type="number"
+                value={conversion}
+                onChange={e => setConversion(e.target.value)}
+                placeholder="e.g. 24"
+                className="w-full outline-none font-bold rounded-xl px-3 py-2 border"
+                style={{ fontSize: "16px", background: subCard, color: text, borderColor: cardBorder }}
+              />
+            </div>
+          )}
+        </div>
+
         {/* Barcode */}
         <div className="rounded-2xl p-4 mb-3 border" style={{ background: card, borderColor: cardBorder }}>
           <label className="text-xs font-semibold uppercase tracking-wider block mb-2" style={{ color: textMuted }}>{t.barcode}</label>
@@ -185,20 +280,32 @@ export function AddProductScreen() {
         {/* Category */}
         <div className="rounded-2xl p-4 mb-3 border" style={{ background: card, borderColor: cardBorder }}>
           <label className="text-xs font-semibold uppercase tracking-wider block mb-3" style={{ color: textMuted }}>{t.category}</label>
+          {!canUseCategories && (
+            <p className="text-[11px] mb-2" style={{ color: textMuted }}>
+              Categories are unlocked on Plus. Using "General" for now.
+            </p>
+          )}
           <div className="flex flex-wrap gap-2">
             {categories.map(cat => (
+              (() => {
+                const disabled = !canUseCategories && cat !== "General";
+                return (
               <button
                 key={cat}
-                onClick={() => setCategory(cat)}
+                onClick={() => !disabled && setCategory(cat)}
                 className="px-3 py-1.5 rounded-full text-xs font-semibold transition-all"
                 style={{
                   background: category === cat ? "#7c3aed" : subCard,
                   color: category === cat ? "#ffffff" : textMuted,
                   border: `1px solid ${category === cat ? "#7c3aed" : cardBorder}`,
+                  opacity: disabled ? 0.4 : 1,
                 }}
+                disabled={disabled}
               >
                 {cat}
               </button>
+                );
+              })()
             ))}
           </div>
         </div>

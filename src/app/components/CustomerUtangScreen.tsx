@@ -16,6 +16,7 @@ export function CustomerUtangScreen() {
   const customer = customers.find(c => c.id === id);
   const [showPayModal, setShowPayModal] = useState(false);
   const [payingTxId, setPayingTxId] = useState<string | null>(null);
+  const [payAmount, setPayAmount] = useState("");
   const [paidSuccess, setPaidSuccess] = useState(false);
 
   const card = isDark ? "#1f2937" : "#ffffff";
@@ -34,14 +35,22 @@ export function CustomerUtangScreen() {
   }
 
   const balance = getCustomerBalance(id!);
-  const unpaidTx = customer.transactions.filter(tx => !tx.paid);
-  const paidTx = customer.transactions.filter(tx => tx.paid);
+  const unpaidTx = customer.transactions.filter(tx => tx.balance > 0);
+  const paidTx = customer.transactions.filter(tx => tx.balance === 0);
 
   const handleRecordPayment = () => {
     if (!payingTxId) return;
-    recordPayment(id!, payingTxId);
+    const tx = customer.transactions.find(t => t.id === payingTxId);
+    const amt = parseFloat(payAmount || "") || tx?.balance || 0;
+    if (!amt || amt <= 0) return;
+    recordPayment(id!, payingTxId, amt);
     setPaidSuccess(true);
-    setTimeout(() => { setPaidSuccess(false); setShowPayModal(false); setPayingTxId(null); }, 1300);
+    setTimeout(() => {
+      setPaidSuccess(false);
+      setShowPayModal(false);
+      setPayingTxId(null);
+      setPayAmount("");
+    }, 1300);
   };
 
   const formatDate = (dateStr: string) => {
@@ -158,22 +167,22 @@ export function CustomerUtangScreen() {
                     </div>
                     <span className="text-sm font-semibold text-red-500">{formatDate(tx.date)}</span>
                   </div>
-                  <span className="text-red-500 font-black">₱{tx.total.toFixed(2)}</span>
+                  <span className="text-red-500 font-black">₱{tx.balance.toFixed(2)}</span>
                 </div>
                 <div className="px-4 py-3">
                   {tx.items.map((item, i) => (
                     <div key={i} className="flex justify-between py-1.5 border-b last:border-0" style={{ borderColor: cardBorder }}>
                       <span className="text-sm" style={{ color: textMuted }}>{item.name} × {item.qty}</span>
-                      <span className="text-sm font-medium" style={{ color: text }}>₱{(item.price * item.qty).toFixed(2)}</span>
+                      <span className="text-sm font-medium" style={{ color: text }}>₱{(item.subtotal ?? item.price * item.qty).toFixed(2)}</span>
                     </div>
                   ))}
                 </div>
                 <div className="px-4 pb-3">
                   <button
-                    onClick={() => { setPayingTxId(tx.id); setShowPayModal(true); }}
+                    onClick={() => { setPayingTxId(tx.id); setPayAmount(tx.balance.toString()); setShowPayModal(true); }}
                     className="w-full py-2.5 rounded-xl bg-green-500 text-white text-sm font-semibold active:scale-95 transition-transform"
                   >
-                    ✓ {t.paidBtn} ₱{tx.total.toFixed(2)}
+                    ✓ {t.paidBtn} ₱{tx.balance.toFixed(2)}
                   </button>
                 </div>
               </div>
@@ -208,7 +217,7 @@ export function CustomerUtangScreen() {
                     <span className="text-sm font-semibold text-green-500">{formatDate(tx.date)}</span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <span className="text-green-500 font-bold">₱{tx.total.toFixed(2)}</span>
+                    <span className="text-green-500 font-bold">₱{tx.amount.toFixed(2)}</span>
                     <span className="text-xs px-2 py-0.5 rounded-full font-semibold"
                       style={{ background: isDark ? "#166534" : "#dcfce7", color: "#16a34a" }}>
                       {t.paid}
@@ -219,7 +228,7 @@ export function CustomerUtangScreen() {
                   {tx.items.map((item, i) => (
                     <div key={i} className="flex justify-between py-1.5 border-b last:border-0" style={{ borderColor: cardBorder }}>
                       <span className="text-sm" style={{ color: textMuted }}>{item.name} × {item.qty}</span>
-                      <span className="text-sm" style={{ color: textMuted }}>₱{(item.price * item.qty).toFixed(2)}</span>
+                      <span className="text-sm" style={{ color: textMuted }}>₱{(item.subtotal ?? item.price * item.qty).toFixed(2)}</span>
                     </div>
                   ))}
                 </div>
@@ -268,7 +277,23 @@ export function CustomerUtangScreen() {
                     >
                       <p className="text-sm font-medium text-green-600">
                         <span className="font-bold">{customer.name}</span>{" "}
-                        {t.willPay} ₱{customer.transactions.find(tx => tx.id === payingTxId)?.total.toFixed(2)}
+                        {t.willPay} ₱{customer.transactions.find(tx => tx.id === payingTxId)?.balance.toFixed(2)}
+                      </p>
+                    </div>
+                    <div className="rounded-2xl p-4 mb-4 border" style={{ background: card, borderColor: cardBorder }}>
+                      <label className="text-xs font-semibold uppercase tracking-wider block mb-2" style={{ color: textMuted }}>
+                        Payment Amount
+                      </label>
+                      <input
+                        type="number"
+                        value={payAmount}
+                        onChange={e => setPayAmount(e.target.value)}
+                        placeholder="0.00"
+                        className="w-full outline-none font-bold"
+                        style={{ fontSize: "20px", background: "transparent", color: text }}
+                      />
+                      <p className="text-[11px] mt-1" style={{ color: textMuted }}>
+                        Remaining: ₱{customer.transactions.find(tx => tx.id === payingTxId)?.balance.toFixed(2)}
                       </p>
                     </div>
                     <div className="flex gap-3">

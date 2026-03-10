@@ -1,14 +1,18 @@
 import React, { useState } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, AreaChart, Area } from "recharts";
 import { TrendingUp, ShoppingBag, Users, DollarSign, TrendingDown, Zap, AlertTriangle } from "lucide-react";
-import { useStore, canAccess } from "../context/StoreContext";
+import { useStore, canAccess, Product } from "../context/StoreContext";
 import { TierBadge, TierGate, SectionHeader } from "./TierComponents";
 
 type Period = "today" | "week" | "all";
 const COLORS = ["#2563eb", "#7c3aed", "#d97706", "#16a34a", "#dc2626", "#06b6d4"];
 
 export function AnalyticsScreen() {
-  const { sales, customers, getCustomerBalance, products, settings, t, getProductAnalytics, getSmartRestockSuggestions } = useStore();
+  const {
+    sales, customers, getCustomerBalance, products, settings, t,
+    getProductAnalytics, getSmartRestockSuggestions,
+    getHourlySales, getDailySales, getTopSellingProducts, getProductProfitability,
+  } = useStore();
   const isDark = settings.theme === "dark";
   const sub = settings.subscription;
 
@@ -19,6 +23,17 @@ export function AnalyticsScreen() {
   const bg = isDark ? "#111827" : "#f9fafb";
   const text = isDark ? "#f9fafb" : "#111827";
   const textMuted = isDark ? "#9ca3af" : "#6b7280";
+
+  const sellingStock = (p: Product) => {
+    const factor =
+      p.unit === "pack" || p.unit === "box"
+        ? p.conversion || 1
+        : p.unit === "kg" || p.unit === "liters"
+        ? 1000
+        : 1;
+    const qty = (p.stock || 0) / factor;
+    return p.unit === "kg" || p.unit === "liters" ? parseFloat(qty.toFixed(2)) : Math.floor(qty);
+  };
 
   const now = new Date();
   const todayStr = now.toISOString().split("T")[0];
@@ -45,6 +60,13 @@ export function AnalyticsScreen() {
     return { day: d.toLocaleDateString("en-PH", { weekday: "short" }), amount };
   });
 
+  const hourlyChartData = getHourlySales().map(h => ({
+    hour: `${h.hour.toString().padStart(2, "0")}:00`,
+    amount: h.total,
+  }));
+
+  const productProfitability = getProductProfitability(5);
+
   const productAnalytics = getProductAnalytics(period);
   const topSelling = productAnalytics.slice(0, 5);
   const fastestMoving = [...productAnalytics].sort((a, b) => b.avgDaily - a.avgDaily).slice(0, 5);
@@ -68,6 +90,26 @@ export function AnalyticsScreen() {
     { key: "week", label: t.week },
     { key: "all", label: t.allTime },
   ];
+
+  if (!canAccess(sub, "plus")) {
+    return (
+      <div className="flex flex-col h-full" style={{ background: bg }}>
+        <div style={{ background: "linear-gradient(160deg, #052e16 0%, #065f46 60%, #059669 100%)" }} className="px-4 pt-4 pb-5 flex-shrink-0">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h2 className="text-white font-bold" style={{ fontSize: "20px" }}>{t.analytics}</h2>
+              <p className="text-green-300 text-xs mt-0.5">{t.last7Days}</p>
+            </div>
+            <TierBadge tier={sub} size="sm" />
+          </div>
+        </div>
+        <div className="flex-1 p-4 space-y-4">
+          <UpgradeBanner from={sub} to="plus" />
+          <TierGate required="plus" featureName={t.analytics} />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-full" style={{ background: bg }}>
@@ -137,6 +179,18 @@ export function AnalyticsScreen() {
           </ResponsiveContainer>
         </div>
 
+        {/* Hourly sales */}
+        <div className="rounded-2xl border p-4 mb-4" style={{ background: card, borderColor: cardBorder }}>
+          <SectionHeader title={t.earningsPerHour} />
+          <ResponsiveContainer width="100%" height={140}>
+            <BarChart data={hourlyChartData} margin={{ top: 5, right: 0, bottom: 0, left: 0 }}>
+              <XAxis dataKey="hour" tick={{ fontSize: 9, fill: textMuted }} axisLine={false} tickLine={false} />
+              <Tooltip content={<CustomTooltip />} />
+              <Bar dataKey="amount" fill="#2563eb" radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
         {/* Top Selling */}
         <div className="rounded-2xl border p-4 mb-4" style={{ background: card, borderColor: cardBorder }}>
           <SectionHeader title={t.topSelling} />
@@ -192,14 +246,15 @@ export function AnalyticsScreen() {
               <p className="text-sm text-center py-2" style={{ color: textMuted }}>All stock levels healthy!</p>
             ) : (
               predictedLowStock.map(s => {
-                const daysLeft = s.avgDailySales > 0 ? Math.floor(s.product.stock / s.avgDailySales) : 999;
+                const currentStock = sellingStock(s.product);
+                const daysLeft = s.avgDailySales > 0 ? Math.floor(currentStock / s.avgDailySales) : 999;
                 return (
                   <div key={s.product.id} className="flex items-center gap-3 py-2.5 border-b last:border-0" style={{ borderColor: cardBorder }}>
                     <span className="text-lg">{s.product.emoji}</span>
                     <div className="flex-1">
                       <p className="text-sm font-medium" style={{ color: text }}>{s.product.name}</p>
                       <p className="text-xs" style={{ color: textMuted }}>
-                        {s.product.stock} left · {s.avgDailySales.toFixed(1)}/day
+                        {currentStock} left · {s.avgDailySales.toFixed(1)}/day
                       </p>
                     </div>
                     <span
@@ -221,6 +276,28 @@ export function AnalyticsScreen() {
             <TierGate required="plus" featureName={t.predictedLowStock} compact />
           </div>
         )}
+
+        {/* Profitability */}
+        <div className="rounded-2xl border p-4 mb-4" style={{ background: card, borderColor: cardBorder }}>
+          <SectionHeader title="Product Profitability" />
+          {productProfitability.length === 0 ? (
+            <p className="text-sm text-center py-2" style={{ color: textMuted }}>No sales yet</p>
+          ) : (
+            productProfitability.map(item => (
+              <div key={item.name} className="flex items-center gap-3 py-2 border-b last:border-0" style={{ borderColor: cardBorder }}>
+                <span className="text-lg">{item.emoji}</span>
+                <div className="flex-1">
+                  <p className="text-sm font-medium" style={{ color: text }}>{item.name}</p>
+                  <p className="text-xs" style={{ color: textMuted }}>Margin {(item.margin * 100).toFixed(1)}%</p>
+                </div>
+                <div className="text-right">
+                  <p className="font-bold text-sm" style={{ color: item.profit >= 0 ? "#16a34a" : "#ef4444" }}>₱{item.profit.toFixed(2)}</p>
+                  <p className="text-[11px]" style={{ color: textMuted }}>₱{item.revenue.toFixed(0)} sales</p>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
 
         {/* Slow Moving - Premium */}
         {canAccess(sub, "premium") ? (

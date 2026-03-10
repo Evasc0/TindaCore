@@ -1,12 +1,18 @@
 import React, { createContext, useContext, useState, useCallback, useMemo } from "react";
 
+export type Unit = "piece" | "pack" | "box" | "kg" | "grams" | "ml" | "liters";
+type BaseUnit = "piece" | "grams" | "ml";
+
 // ─── Types ─────────────────────────────────────────────────────────────────────
 export interface Product {
   id: string;
   name: string;
   price: number;
   cost: number; // purchase cost for COGS
-  stock: number;
+  stock: number; // stored in base units
+  unit: Unit; // selling unit displayed in UI
+  baseUnit: BaseUnit; // canonical unit for stock tracking
+  conversion?: number; // number of base units per selling unit
   barcode?: string;
   category: string;
   isQuickItem: boolean;
@@ -18,30 +24,36 @@ export interface CartItem {
   productName: string;
   price: number;
   quantity: number;
+  unit: Unit;
+  subtotal: number;
 }
 
-export interface UtangTransaction {
+export interface UtangRecord {
   id: string;
   date: string;
-  items: { name: string; qty: number; price: number }[];
-  total: number;
-  paid: boolean;
+  items: { productId?: string; name: string; qty: number; unit: Unit; price: number; subtotal: number }[];
+  amount: number;
+  balance: number;
+  payments: { id: string; amount: number; date: string }[];
 }
 
 export interface Customer {
   id: string;
   name: string;
   phone?: string;
-  transactions: UtangTransaction[];
+  transactions: UtangRecord[];
 }
 
 export interface Sale {
   id: string;
-  date: string;
-  items: { name: string; qty: number; price: number }[];
+  timestamp: string;
+  date: string; // retained for existing UI filters
+  items: { productId?: string; name: string; qty: number; unit: Unit; price: number; cost?: number; subtotal: number }[];
   total: number;
   paymentType: "cash" | "utang" | "gcash" | "paymaya";
+  isUtang: boolean;
   customerName?: string;
+  customerId?: string;
   helperName?: string;
 }
 
@@ -49,9 +61,10 @@ export interface PabiliOrder {
   id: string;
   customerName: string;
   customerPhone?: string;
-  items: { name: string; qty: number; price: number }[];
+  items: { name: string; qty: number; price: number; unit?: Unit }[];
   status: "pending" | "preparing" | "done" | "dismissed";
-  date: string;
+  date: string; // legacy
+  timestamp: string;
   note?: string;
   total: number;
 }
@@ -59,7 +72,8 @@ export interface PabiliOrder {
 export interface Expense {
   id: string;
   date: string;
-  description: string;
+  name: string;
+  description?: string;
   amount: number;
   category: "utilities" | "supplies" | "rent" | "other";
 }
@@ -644,6 +658,40 @@ export const translations = {
 };
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
+
+const getBaseUnit = (unit: Unit): BaseUnit => {
+  if (unit === "kg" || unit === "grams") return "grams";
+  if (unit === "ml" || unit === "liters") return "ml";
+  return "piece";
+};
+
+const toBaseUnits = (product: Product, qty: number) => {
+  const factor =
+    product.unit === "pack" || product.unit === "box"
+      ? product.conversion || 1
+      : product.unit === "kg" || product.unit === "liters"
+      ? 1000
+      : 1;
+  return qty * factor;
+};
+
+const fromBaseUnits = (product: Product, baseQty: number) => {
+  const factor =
+    product.unit === "pack" || product.unit === "box"
+      ? product.conversion || 1
+      : product.unit === "kg" || product.unit === "liters"
+      ? 1000
+      : 1;
+  return baseQty / factor;
+};
+
+const formatStockDisplay = (product: Product) => {
+  const sellingQty = fromBaseUnits(product, product.stock);
+  if (product.unit === "kg" || product.unit === "liters") {
+    return parseFloat(sellingQty.toFixed(2));
+  }
+  return Math.floor(sellingQty);
+};
 export function canAccess(subscription: SubscriptionTier, required: SubscriptionTier): boolean {
   const order: SubscriptionTier[] = ["free", "plus", "premium"];
   return order.indexOf(subscription) >= order.indexOf(required);
@@ -676,6 +724,8 @@ interface StoreContextType {
   addProduct: (p: Omit<Product, "id">) => void;
   updateProduct: (id: string, p: Partial<Product>) => void;
   deleteProduct: (id: string) => void;
+  addStock: (id: string, qty: number, unit?: Unit) => void;
+  searchProducts?: (query: string) => Product[];
   // Cart
   addToCart: (productId: string) => void;
   removeFromCart: (productId: string) => void;
@@ -683,11 +733,11 @@ interface StoreContextType {
   clearCart: () => void;
   addPabiliToCart: (order: PabiliOrder) => void;
   // Sales
-  completeSale: (amountPaid: number, method?: string) => void;
+  completeSale: (amountPaid: number, method?: Sale["paymentType"]) => void;
   addUtangSale: (customerId: string) => void;
   // Customers
   addCustomer: (name: string, phone?: string) => void;
-  recordPayment: (customerId: string, txId: string) => void;
+  recordPayment: (customerId: string, txId: string, amount: number) => void;
   getCustomerBalance: (customerId: string) => number;
   // Pabili
   addPabiliOrder: (order: Omit<PabiliOrder, "id">) => void;
@@ -700,6 +750,10 @@ interface StoreContextType {
   // Analytics
   getWeeklyRevenue: () => number;
   getWeeklyProfit: () => number;
+  getHourlySales: (date?: Date) => { hour: number; total: number }[];
+  getDailySales: (days?: number) => { date: string; total: number }[];
+  getTopSellingProducts: (limit?: number) => Array<{ name: string; qty: number; revenue: number; profit: number; emoji: string }>;
+  getProductProfitability: (limit?: number) => Array<{ name: string; profit: number; revenue: number; cost: number; emoji: string; margin: number }>;
   getSmartRestockSuggestions: () => Array<{
     product: Product;
     avgDailySales: number;
@@ -721,7 +775,7 @@ interface StoreContextType {
 const StoreContext = createContext<StoreContextType | null>(null);
 
 // ─── Initial data ──────────────────────────────────────────────────────────────
-const initialProducts: Product[] = [
+const seedProducts = [
   { id: "p1", name: "Coke Mismo", price: 15, cost: 10, stock: 48, barcode: "4800888114919", category: "Beverages", isQuickItem: true, emoji: "🥤" },
   { id: "p2", name: "Lucky Me Pancit", price: 14, cost: 9, stock: 36, barcode: "4800016150014", category: "Noodles", isQuickItem: true, emoji: "🍜" },
   { id: "p3", name: "Sardinas (555)", price: 22, cost: 15, stock: 4, barcode: "4806029030012", category: "Canned Goods", isQuickItem: true, emoji: "🐟" },
@@ -736,6 +790,13 @@ const initialProducts: Product[] = [
   { id: "p12", name: "Skyflakes (Small)", price: 10, cost: 7, stock: 45, barcode: "", category: "Snacks", isQuickItem: false, emoji: "🥨" },
 ];
 
+const initialProducts: Product[] = seedProducts.map(p => ({
+  unit: "piece",
+  baseUnit: "piece",
+  conversion: 1,
+  ...p,
+}));
+
 const today = new Date();
 const fmt = (d: Date) => d.toISOString().split("T")[0];
 const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1);
@@ -745,7 +806,7 @@ const fourDaysAgo = new Date(today); fourDaysAgo.setDate(today.getDate() - 4);
 const fiveDaysAgo = new Date(today); fiveDaysAgo.setDate(today.getDate() - 5);
 const sixDaysAgo = new Date(today); sixDaysAgo.setDate(today.getDate() - 6);
 
-const initialCustomers = [
+const seedCustomers = [
   { id: "c1", name: "Aling Nena", phone: "09171234567", transactions: [
     { id: "t1", date: fmt(today), items: [{ name: "Lucky Me Pancit", qty: 2, price: 14 }, { name: "Coke Mismo", qty: 1, price: 15 }], total: 43, paid: false },
     { id: "t2", date: fmt(yesterday), items: [{ name: "Tasty Bread", qty: 1, price: 58 }], total: 58, paid: false },
@@ -762,13 +823,47 @@ const initialCustomers = [
   ]},
 ];
 
-const mkSale = (date: Date, hour: number, items: { name: string; qty: number; price: number }[], type: Sale["paymentType"] = "cash"): Sale => ({
-  id: `s${Date.now()}-${Math.random()}`,
-  date: `${fmt(date)}T${String(hour).padStart(2, "0")}:${String(Math.floor(Math.random() * 59)).padStart(2, "0")}:00`,
-  items,
-  total: items.reduce((s, i) => s + i.price * i.qty, 0),
-  paymentType: type,
-});
+const initialCustomers: Customer[] = seedCustomers.map(c => ({
+  ...c,
+  transactions: c.transactions.map(tx => ({
+    id: tx.id,
+    date: tx.date,
+    customerId: c.id,
+    items: tx.items.map(item => ({
+      ...item,
+      unit: "piece",
+      subtotal: item.price * item.qty,
+    })),
+    amount: tx.total,
+    balance: tx.paid ? 0 : tx.total,
+    payments: tx.paid ? [{ id: `pay-${tx.id}`, amount: tx.total, date: tx.date }] : [],
+  })),
+}));
+
+const mkSale = (date: Date, hour: number, items: { name: string; qty: number; price: number }[], type: Sale["paymentType"] = "cash"): Sale => {
+  const timestamp = `${fmt(date)}T${String(hour).padStart(2, "0")}:${String(Math.floor(Math.random() * 59)).padStart(2, "0")}:00`;
+  return {
+    id: `s${Date.now()}-${Math.random()}`,
+    timestamp,
+    date: timestamp,
+    items: items.map(item => {
+      const product = initialProducts.find(p => p.name === item.name);
+      const cost = product?.cost ?? item.price * 0.65;
+      return {
+        productId: product?.id,
+        name: item.name,
+        qty: item.qty,
+        unit: product?.unit || "piece",
+        price: item.price,
+        cost,
+        subtotal: item.price * item.qty,
+      };
+    }),
+    total: items.reduce((s, i) => s + i.price * i.qty, 0),
+    paymentType: type,
+    isUtang: type === "utang",
+  };
+};
 
 const initialSales: Sale[] = [
   mkSale(today, 8, [{ name: "Coke Mismo", qty: 2, price: 15 }, { name: "Lucky Me Pancit", qty: 1, price: 14 }]),
@@ -823,13 +918,17 @@ const initialPabiliOrders: PabiliOrder[] = [
     date: new Date(Date.now() - 25 * 60000).toISOString(),
     total: 65,
   },
-];
+].map(o => ({
+  ...o,
+  timestamp: o.date,
+  items: o.items.map(i => ({ unit: "piece", ...i })),
+}));
 
 const initialExpenses: Expense[] = [
-  { id: "exp1", date: `${fmt(today).substring(0, 7)}-01`, description: "Electricity Bill", amount: 1200, category: "utilities" },
-  { id: "exp2", date: `${fmt(today).substring(0, 7)}-01`, description: "Water Bill", amount: 350, category: "utilities" },
-  { id: "exp3", date: `${fmt(today).substring(0, 7)}-03`, description: "Plastic Bags & Supplies", amount: 220, category: "supplies" },
-  { id: "exp4", date: `${fmt(today).substring(0, 7)}-05`, description: "Store Rent", amount: 2500, category: "rent" },
+  { id: "exp1", date: `${fmt(today).substring(0, 7)}-01`, name: "Electricity Bill", amount: 1200, category: "utilities" },
+  { id: "exp2", date: `${fmt(today).substring(0, 7)}-01`, name: "Water Bill", amount: 350, category: "utilities" },
+  { id: "exp3", date: `${fmt(today).substring(0, 7)}-03`, name: "Plastic Bags & Supplies", amount: 220, category: "supplies" },
+  { id: "exp4", date: `${fmt(today).substring(0, 7)}-05`, name: "Store Rent", amount: 2500, category: "rent" },
 ];
 
 const initialSettings: StoreSettings = {
@@ -838,11 +937,11 @@ const initialSettings: StoreSettings = {
   address: "Brgy. 123, Maynila",
   theme: "light",
   language: "fil",
-  subscription: "premium",
+  subscription: "free",
   gcashNumber: "09171234567",
   paymayaNumber: "",
   managementPIN: "1234",
-  isOnboardingComplete: true,
+  isOnboardingComplete: false,
   enableUtang: true,
   enablePabili: true,
   enableBarcodeScanner: true,
@@ -864,7 +963,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [operatingUser, setOperatingUserState] = useState("Helper");
 
   const t = translations[settings.language];
-  const cartTotal = cart.reduce((sum, item) => sum + item.price * item.quantity, 0);
+  const cartTotal = cart.reduce((sum, item) => sum + item.subtotal, 0);
 
   const updateSettings = useCallback((s: Partial<StoreSettings>) => {
     setSettings(prev => ({ ...prev, ...s }));
@@ -911,14 +1010,71 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   // Products
   const addProduct = useCallback((p: Omit<Product, "id">) => {
-    setProducts(prev => [...prev, { ...p, id: `p${Date.now()}` }]);
+    const unit = p.unit || "piece";
+    const conversion = p.conversion || (unit === "pack" || unit === "box" ? 1 : 1);
+    const baseUnit = p.baseUnit || getBaseUnit(unit);
+    const stockBase = unit === "pack" || unit === "box"
+      ? (p.stock || 0) * conversion
+      : unit === "kg" || unit === "liters"
+      ? (p.stock || 0) * 1000
+      : p.stock || 0;
+    setProducts(prev => [
+      ...prev,
+      {
+        ...p,
+        id: `p${Date.now()}`,
+        unit,
+        baseUnit,
+        conversion,
+        stock: stockBase,
+      },
+    ]);
   }, []);
+
   const updateProduct = useCallback((id: string, p: Partial<Product>) => {
-    setProducts(prev => prev.map(x => x.id === id ? { ...x, ...p } : x));
+    setProducts(prev => prev.map(x => {
+      if (x.id !== id) return x;
+      const unit = p.unit || x.unit;
+      const conversion = p.conversion || x.conversion || 1;
+      const baseUnit = p.baseUnit || x.baseUnit || getBaseUnit(unit);
+      const stockProvided = p.stock;
+      const stockBase = stockProvided === undefined
+        ? x.stock
+        : unit === "pack" || unit === "box"
+        ? stockProvided * conversion
+        : unit === "kg" || unit === "liters"
+        ? stockProvided * 1000
+        : stockProvided;
+      return { ...x, ...p, unit, baseUnit, conversion, stock: stockBase };
+    }));
   }, []);
+
+  const addStock = useCallback((productId: string, qty: number, unit?: Unit) => {
+    if (qty <= 0) return;
+    setProducts(prev => prev.map(p => {
+      if (p.id !== productId) return p;
+      const targetUnit = unit || p.unit;
+      const factor =
+        targetUnit === "pack" || targetUnit === "box"
+          ? p.conversion || 1
+          : targetUnit === "kg" || targetUnit === "liters"
+          ? 1000
+          : 1;
+      return { ...p, stock: p.stock + qty * factor };
+    }));
+  }, []);
+
   const deleteProduct = useCallback((id: string) => {
     setProducts(prev => prev.filter(x => x.id !== id));
   }, []);
+
+  const searchProducts = useCallback((query: string) => {
+    const q = query.toLowerCase();
+    return products.filter(p =>
+      p.name.toLowerCase().includes(q) ||
+      (p.barcode || "").includes(query)
+    );
+  }, [products]);
 
   // Cart
   const addToCart = useCallback((productId: string) => {
@@ -926,17 +1082,33 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     if (!product || product.stock <= 0) return;
     setCart(prev => {
       const existing = prev.find(i => i.productId === productId);
-      if (existing) return prev.map(i => i.productId === productId ? { ...i, quantity: i.quantity + 1 } : i);
-      return [...prev, { productId, productName: product.name, price: product.price, quantity: 1 }];
+      const nextQty = (existing?.quantity || 0) + 1;
+      const neededBase = toBaseUnits(product, nextQty);
+      if (neededBase > product.stock) return prev; // not enough stock
+      if (existing) {
+        return prev.map(i => i.productId === productId
+          ? { ...i, quantity: nextQty, subtotal: nextQty * i.price }
+          : i);
+      }
+      return [...prev, { productId, productName: product.name, price: product.price, quantity: 1, unit: product.unit, subtotal: product.price }];
     });
   }, [products]);
   const removeFromCart = useCallback((productId: string) => {
     setCart(prev => prev.filter(i => i.productId !== productId));
   }, []);
   const updateCartQty = useCallback((productId: string, qty: number) => {
-    if (qty <= 0) setCart(prev => prev.filter(i => i.productId !== productId));
-    else setCart(prev => prev.map(i => i.productId === productId ? { ...i, quantity: qty } : i));
-  }, []);
+    const product = products.find(p => p.id === productId);
+    if (!product) return;
+    if (qty <= 0) {
+      setCart(prev => prev.filter(i => i.productId !== productId));
+      return;
+    }
+    const maxQty = Math.floor(product.stock / (toBaseUnits(product, 1) || 1));
+    const safeQty = Math.min(qty, Math.max(0, maxQty));
+    setCart(prev => prev.map(i => i.productId === productId
+      ? { ...i, quantity: safeQty, subtotal: safeQty * i.price }
+      : i));
+  }, [products]);
   const clearCart = useCallback(() => setCart([]), []);
   const addPabiliToCart = useCallback((order: PabiliOrder) => {
     setCart([]);
@@ -945,8 +1117,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       if (product) {
         setCart(prev => {
           const existing = prev.find(i => i.productId === product.id);
-          if (existing) return prev.map(i => i.productId === product.id ? { ...i, quantity: i.quantity + item.qty } : i);
-          return [...prev, { productId: product.id, productName: product.name, price: product.price, quantity: item.qty }];
+          const nextQty = (existing?.quantity || 0) + item.qty;
+          const neededBase = toBaseUnits(product, nextQty);
+          if (neededBase > product.stock) return prev;
+          if (existing) return prev.map(i => i.productId === product.id ? { ...i, quantity: nextQty, subtotal: nextQty * i.price } : i);
+          return [...prev, { productId: product.id, productName: product.name, price: product.price, quantity: item.qty, unit: product.unit, subtotal: product.price * item.qty }];
         });
       }
     });
@@ -955,66 +1130,115 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   // Sales
   const completeSale = useCallback((amountPaid: number, method = "cash") => {
     if (cart.length === 0) return;
+    const now = new Date().toISOString();
     setSales(prev => [{
       id: `s${Date.now()}`,
-      date: new Date().toISOString(),
-      items: cart.map(i => ({ name: i.productName, qty: i.quantity, price: i.price })),
+      timestamp: now,
+      date: now,
+      items: cart.map(i => {
+        const product = products.find(p => p.id === i.productId);
+        return {
+          productId: i.productId,
+          name: i.productName,
+          qty: i.quantity,
+          unit: i.unit,
+          price: i.price,
+          cost: product?.cost ?? i.price * 0.65,
+          subtotal: i.subtotal,
+        };
+      }),
       total: cartTotal,
       paymentType: method as Sale["paymentType"],
+      isUtang: false,
       helperName: operatingUser,
     }, ...prev]);
     setProducts(prev => prev.map(p => {
       const ci = cart.find(i => i.productId === p.id);
-      return ci ? { ...p, stock: Math.max(0, p.stock - ci.quantity) } : p;
+      return ci ? { ...p, stock: Math.max(0, p.stock - toBaseUnits(p, ci.quantity)) } : p;
     }));
     setCart([]);
-  }, [cart, cartTotal, operatingUser]);
+  }, [cart, cartTotal, operatingUser, products]);
 
   const addUtangSale = useCallback((customerId: string) => {
     if (cart.length === 0) return;
-    const newTx: UtangTransaction = {
+    const now = new Date();
+    const nowStr = now.toISOString();
+    const newTx: UtangRecord = {
       id: `t${Date.now()}`,
-      date: new Date().toISOString().split("T")[0],
-      items: cart.map(i => ({ name: i.productName, qty: i.quantity, price: i.price })),
-      total: cartTotal,
-      paid: false,
+      date: nowStr.split("T")[0],
+      customerId,
+      items: cart.map(i => ({
+        productId: i.productId,
+        name: i.productName,
+        qty: i.quantity,
+        unit: i.unit,
+        price: i.price,
+        subtotal: i.subtotal,
+      })),
+      amount: cartTotal,
+      balance: cartTotal,
+      payments: [],
     };
     setSales(prev => [{
       id: `s${Date.now()}`,
-      date: new Date().toISOString(),
-      items: cart.map(i => ({ name: i.productName, qty: i.quantity, price: i.price })),
+      timestamp: nowStr,
+      date: nowStr,
+      items: cart.map(i => ({
+        productId: i.productId,
+        name: i.productName,
+        qty: i.quantity,
+        unit: i.unit,
+        price: i.price,
+        cost: products.find(p => p.id === i.productId)?.cost ?? i.price * 0.65,
+        subtotal: i.subtotal,
+      })),
       total: cartTotal,
       paymentType: "utang",
+      isUtang: true,
+      customerId,
       customerName: customers.find(c => c.id === customerId)?.name,
       helperName: operatingUser,
     }, ...prev]);
     setCustomers(prev => prev.map(c => c.id === customerId ? { ...c, transactions: [newTx, ...c.transactions] } : c));
     setProducts(prev => prev.map(p => {
       const ci = cart.find(i => i.productId === p.id);
-      return ci ? { ...p, stock: Math.max(0, p.stock - ci.quantity) } : p;
+      return ci ? { ...p, stock: Math.max(0, p.stock - toBaseUnits(p, ci.quantity)) } : p;
     }));
     setCart([]);
-  }, [cart, cartTotal, customers, operatingUser]);
+  }, [cart, cartTotal, customers, operatingUser, products]);
 
   // Customers
   const addCustomer = useCallback((name: string, phone?: string) => {
     setCustomers(prev => [...prev, { id: `c${Date.now()}`, name, phone, transactions: [] }]);
   }, []);
-  const recordPayment = useCallback((customerId: string, txId: string) => {
+  const recordPayment = useCallback((customerId: string, txId: string, amount: number) => {
+    if (amount <= 0) return;
     setCustomers(prev => prev.map(c => c.id === customerId ? {
       ...c,
-      transactions: c.transactions.map(t => t.id === txId ? { ...t, paid: true } : t),
+      transactions: c.transactions.map(t => {
+        if (t.id !== txId) return t;
+        const payAmt = Math.min(amount, t.balance);
+        return {
+          ...t,
+          balance: Math.max(0, t.balance - payAmt),
+          payments: [...t.payments, { id: `pay${Date.now()}`, amount: payAmt, date: new Date().toISOString() }],
+        };
+      }),
     } : c));
   }, []);
   const getCustomerBalance = useCallback((customerId: string) => {
     const c = customers.find(x => x.id === customerId);
     if (!c) return 0;
-    return c.transactions.filter(t => !t.paid).reduce((s, t) => s + t.total, 0);
+    return c.transactions.reduce((s, t) => s + t.balance, 0);
   }, [customers]);
 
   // Pabili
   const addPabiliOrder = useCallback((order: Omit<PabiliOrder, "id">) => {
-    setPabiliOrders(prev => [{ ...order, id: `pab${Date.now()}` }, ...prev]);
+    setPabiliOrders(prev => [{
+      ...order,
+      id: `pab${Date.now()}`,
+      timestamp: order.timestamp || order.date || new Date().toISOString(),
+    }, ...prev]);
   }, []);
   const updatePabiliStatus = useCallback((id: string, status: PabiliOrder["status"]) => {
     setPabiliOrders(prev => prev.map(o => o.id === id ? { ...o, status } : o));
@@ -1027,7 +1251,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const checkRestockItem = useCallback((productId: string, checked: boolean, purchasedQty: number) => {
     setRestockList(prev => prev.map(i => i.productId === productId ? { ...i, checked } : i));
     if (checked && purchasedQty > 0) {
-      setProducts(prev => prev.map(p => p.id === productId ? { ...p, stock: p.stock + purchasedQty } : p));
+      setProducts(prev => prev.map(p => {
+        if (p.id !== productId) return p;
+        return { ...p, stock: p.stock + toBaseUnits(p, purchasedQty) };
+      }));
     }
   }, []);
 
@@ -1061,21 +1288,22 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     const productQtyMap: Record<string, number> = {};
     sales.filter(s => new Date(s.date) >= sevenDaysAgo).forEach(s =>
       s.items.forEach(item => {
-        const p = products.find(x => x.name === item.name);
-        if (p) productQtyMap[p.id] = (productQtyMap[p.id] || 0) + item.qty;
+        const p = products.find(x => x.name === item.name || x.id === item.productId);
+        if (p) productQtyMap[p.id] = (productQtyMap[p.id] || 0) + toBaseUnits(p, item.qty);
       })
     );
     return products
       .filter(p => {
-        const avgDaily = (productQtyMap[p.id] || 0) / 7;
-        return avgDaily > 0 && p.stock < avgDaily * 7;
+        const avgDailyBase = (productQtyMap[p.id] || 0) / 7;
+        return avgDailyBase > 0 && p.stock < avgDailyBase * 7;
       })
       .map(p => {
-        const avgDaily = (productQtyMap[p.id] || 0) / 7;
-        const suggested = Math.max(0, Math.ceil(avgDaily * 14 - p.stock));
+        const avgDailyBase = (productQtyMap[p.id] || 0) / 7;
+        const suggestedBase = Math.max(0, Math.ceil(avgDailyBase * 14 - p.stock));
+        const suggested = Math.max(1, Math.ceil(fromBaseUnits(p, suggestedBase)));
         return {
           product: p,
-          avgDailySales: avgDaily,
+          avgDailySales: fromBaseUnits(p, avgDailyBase),
           suggestedQty: suggested,
           estimatedCost: suggested * p.cost,
         };
@@ -1090,11 +1318,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       ? sevenDaysAgo
       : new Date(0);
     const filteredSales = sales.filter(s => new Date(s.date) >= cutoff);
-    const map: Record<string, { qty: number; revenue: number }> = {};
+    const map: Record<string, { qty: number; revenue: number; cost: number }> = {};
     filteredSales.forEach(s => s.items.forEach(item => {
-      if (!map[item.name]) map[item.name] = { qty: 0, revenue: 0 };
+      if (!map[item.name]) map[item.name] = { qty: 0, revenue: 0, cost: 0 };
       map[item.name].qty += item.qty;
       map[item.name].revenue += item.price * item.qty;
+      const product = products.find(p => p.name === item.name);
+      const costPerUnit = product?.cost ?? item.cost ?? item.price * 0.65;
+      map[item.name].cost += costPerUnit * item.qty;
     }));
     const days = period === "today" ? 1 : period === "week" ? 7 : 30;
     return Object.entries(map)
@@ -1103,23 +1334,61 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         emoji: products.find(p => p.name === name)?.emoji || "📦",
         ...data,
         avgDaily: data.qty / days,
+        profit: data.revenue - data.cost,
+        margin: data.revenue > 0 ? (data.revenue - data.cost) / data.revenue : 0,
       }))
       .sort((a, b) => b.revenue - a.revenue);
   }, [sales, products]);
+
+  const getHourlySales = useCallback((date: Date = new Date()) => {
+    const target = fmt(date);
+    return Array.from({ length: 24 }, (_, hour) => {
+      const total = sales
+        .filter(s => s.date.startsWith(target))
+        .filter(s => new Date(s.date).getHours() === hour)
+        .reduce((sum, s) => sum + s.total, 0);
+      return { hour, total };
+    });
+  }, [sales]);
+
+  const getDailySales = useCallback((days: number = 7) => {
+    return Array.from({ length: days }, (_, idx) => {
+      const d = new Date(); d.setDate(d.getDate() - (days - 1 - idx));
+      const ds = fmt(d);
+      const total = sales.filter(s => s.date.startsWith(ds)).reduce((sum, s) => sum + s.total, 0);
+      return { date: ds, total };
+    });
+  }, [sales]);
+
+  const getTopSellingProducts = useCallback((limit: number = 5) => {
+    return getProductAnalytics("all")
+      .sort((a, b) => b.qty - a.qty)
+      .slice(0, limit)
+      .map(({ name, qty, revenue, profit, emoji }) => ({ name, qty, revenue, profit, emoji }));
+  }, [getProductAnalytics]);
+
+  const getProductProfitability = useCallback((limit: number = 5) => {
+    return getProductAnalytics("all")
+      .sort((a, b) => b.profit - a.profit)
+      .slice(0, limit)
+      .map(({ name, profit, revenue, cost, emoji, margin }) => ({ name, profit, revenue, cost, emoji, margin }));
+  }, [getProductAnalytics]);
 
   return (
     <StoreContext.Provider value={{
       products, cart, customers, sales, pabiliOrders, expenses, restockList, settings, t,
       isManagementMode, operatingUser,
       enterManagementMode, exitManagementMode, completeOnboarding, setOperatingUser,
-      addProduct, updateProduct, deleteProduct,
+      addProduct, updateProduct, deleteProduct, addStock, searchProducts,
       addToCart, removeFromCart, updateCartQty, clearCart, addPabiliToCart,
       completeSale, addUtangSale,
       addCustomer, recordPayment, getCustomerBalance,
       addPabiliOrder, updatePabiliStatus,
       updateRestockList, checkRestockItem,
       addExpense,
-      getWeeklyRevenue, getWeeklyProfit, getSmartRestockSuggestions, getProductAnalytics,
+      getWeeklyRevenue, getWeeklyProfit,
+      getSmartRestockSuggestions, getProductAnalytics,
+      getHourlySales, getDailySales, getTopSellingProducts, getProductProfitability,
       updateSettings, cartTotal,
     }}>
       {children}
