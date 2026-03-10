@@ -27,9 +27,10 @@ export async function pushLocalChanges(tables: Table[] = defaultTables) {
   for (const table of tables) {
     const dirty = await getDirtyRows(table);
     if (!dirty.length) continue;
-    const { error } = await supabase.from(table).upsert(dirty, { onConflict: "id" });
+    const deduped = Array.from(new Map(dirty.map(row => [String(row.id), row])).values());
+    const { error } = await supabase.from(table).upsert(deduped, { onConflict: "id" });
     if (error) throw error;
-    await markSynced(table, dirty.map(r => r.id));
+    await markSynced(table, deduped.map(r => String(r.id)));
     await setSyncMarker(table, Date.now());
   }
   return { ok: true };

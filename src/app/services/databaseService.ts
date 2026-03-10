@@ -8,7 +8,14 @@ import type {
   StoreSettings,
   Unit,
 } from "../context/StoreContext";
-import { all, get, run, transaction, getDatabase } from "../database/sqlite";
+import {
+  initializeDatabase as initDb,
+  run,
+  queryAll,
+  queryOne,
+  runTransaction,
+  execRows,
+} from "../database/sqlite";
 
 export type Table =
   | "products"
@@ -21,64 +28,125 @@ export type Table =
   | "expenses"
   | "settings";
 
-const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : `id-${Date.now()}-${Math.random().toString(16).slice(2)}`);
 const now = () => Date.now();
+const generateId = () => Number(`${Date.now()}${Math.floor(Math.random() * 1000)}`);
+type DbId = string | number;
+type ResolvedId = { id: DbId; exists: boolean };
 
-const toBool = (value: any) => value === 1 || value === true || value === "1";
+const stableHash = (value: string) => {
+  let hash = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
+  }
+  return 1_000_000 + (hash % 9_000_000_000); // keep within safe integer range
+};
+const toNumericId = (value?: string | number) => {
+  if (value === undefined || value === null) return generateId();
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const parsed = Number(value);
+  if (Number.isFinite(parsed)) return parsed;
+  return stableHash(String(value));
+};
 
-export async function initializeDatabase() {
-  await getDatabase();
+function resolveExistingIdInTx(
+  db: { exec: (sql: string, params?: Record<string, any>) => any[] },
+  table: "products" | "customers" | "utang_records",
+  incoming: DbId
+): ResolvedId {
+  const numeric = toNumericId(incoming);
+  const numericRows = execRows(db as any, `SELECT id FROM ${table} WHERE id = :id`, { ":id": numeric });
+  if (numericRows.length) return { id: numericRows[0].id, exists: true };
+
+  if (typeof incoming === "string") {
+    const rawRows = execRows(db as any, `SELECT id FROM ${table} WHERE id = :id`, { ":id": incoming });
+    if (rawRows.length) return { id: rawRows[0].id, exists: true };
+  }
+
+  return { id: numeric, exists: false };
 }
 
-// ─── Products ────────────────────────────────────────────────────────────────
+async function resolveExistingId(
+  table: "products" | "customers" | "utang_records",
+  incoming: DbId
+): Promise<ResolvedId> {
+  const numeric = toNumericId(incoming);
+  const byNumeric = await queryOne<{ id: DbId }>(`SELECT id FROM ${table} WHERE id = :id`, { ":id": numeric });
+  if (byNumeric) return { id: byNumeric.id, exists: true };
+
+  if (typeof incoming === "string") {
+    const byRaw = await queryOne<{ id: DbId }>(`SELECT id FROM ${table} WHERE id = :id`, { ":id": incoming });
+    if (byRaw) return { id: byRaw.id, exists: true };
+  }
+
+  return { id: numeric, exists: false };
+}
+
+const unitFactor = (unit?: Unit, conversion?: number) => {
+  if (unit === "pack" || unit === "box") return conversion || 1;
+  if (unit === "kg" || unit === "liters") return 1000;
+  return 1;
+};
+
+const mapProduct = (row: any): Product => ({
+  id: String(row.id),
+  name: row.name,
+  barcode: row.barcode || "",
+  price: Number(row.price),
+  cost: Number(row.cost ?? 0),
+  stock: Number(row.stock ?? 0),
+  unit: (row.unit || "piece") as Unit,
+  baseUnit: (row.base_unit || "piece") as Product["baseUnit"],
+  conversion: Number(row.conversion ?? 1),
+  category: row.category || "General",
+  isQuickItem: !!row.is_quick_item,
+  emoji: row.emoji || "🛒",
+});
+
+async function getDb() {
+  await initDb();
+}
+
+export const initializeDatabase = initDb;
+
+// ─── Products ──────────────────────────────────────────────────────────────
 export async function getProducts(): Promise<Product[]> {
-  const rows = await all<any>("SELECT * FROM products WHERE deleted = 0");
-  return rows.map(row => ({
-    id: row.id,
-    name: row.name,
-    barcode: row.barcode || "",
-    price: Number(row.price),
-    cost: Number(row.cost || 0),
-    stock: Number(row.stock || 0),
-    unit: (row.unit || "piece") as Unit,
-    baseUnit: (row.base_unit || "piece") as Product["baseUnit"],
-    conversion: Number(row.conversion || 1),
-    category: row.category || "General",
-    isQuickItem: toBool(row.is_quick_item),
-    emoji: row.emoji || "🛒",
-  }));
+  await getDb();
+  const rows = await queryAll("SELECT * FROM products ORDER BY name ASC");
+  return rows.map(mapProduct);
 }
 
-export async function createProduct(input: Omit<Product, "id"> & { id?: string }) {
-  const id = input.id || uuid();
+export async function createProduct(input: Omit<Product, "id"> & { id?: string }): Promise<Product> {
+  await getDb();
+  const id = toNumericId(input.id);
   const ts = now();
+  const payload = {
+    ":id": id,
+    ":name": input.name,
+    ":barcode": input.barcode || "",
+    ":price": input.price,
+    ":cost": input.cost ?? 0,
+    ":stock": input.stock ?? 0,
+    ":unit": input.unit || "piece",
+    ":base_unit": input.baseUnit || "piece",
+    ":conversion": input.conversion ?? 1,
+    ":category": input.category || "General",
+    ":is_quick_item": input.isQuickItem ? 1 : 0,
+    ":emoji": input.emoji || "🛒",
+    ":ts": ts,
+  };
   await run(
     `INSERT INTO products (id, name, barcode, price, cost, stock, unit, base_unit, conversion, category, is_quick_item, emoji, updated_at, is_dirty)
      VALUES (:id, :name, :barcode, :price, :cost, :stock, :unit, :base_unit, :conversion, :category, :is_quick_item, :emoji, :ts, 1)`,
-    {
-      ":id": id,
-      ":name": input.name,
-      ":barcode": input.barcode || "",
-      ":price": input.price,
-      ":cost": input.cost,
-      ":stock": input.stock,
-      ":unit": input.unit,
-      ":base_unit": input.baseUnit,
-      ":conversion": input.conversion || 1,
-      ":category": input.category || "General",
-      ":is_quick_item": input.isQuickItem ? 1 : 0,
-      ":emoji": input.emoji || "🛒",
-      ":ts": ts,
-    }
+    payload
   );
-  return { ...input, id };
+  return { ...input, id: String(id) };
 }
 
-export async function updateProductRecord(id: string, updates: Partial<Product>) {
-  const ts = now();
+export async function updateProduct(input: Partial<Product> & { id: string }) {
+  await getDb();
   const fields: string[] = [];
-  const params: Record<string, any> = { ":id": id, ":ts": ts };
-  const map: Record<keyof Partial<Product>, string> = {
+  const params: Record<string, any> = { ":id": toNumericId(input.id), ":ts": now() };
+  const map: Record<string, string> = {
     name: "name",
     barcode: "barcode",
     price: "price",
@@ -91,64 +159,50 @@ export async function updateProductRecord(id: string, updates: Partial<Product>)
     isQuickItem: "is_quick_item",
     emoji: "emoji",
   };
-  Object.entries(updates).forEach(([key, val]) => {
-    const column = map[key as keyof Partial<Product>];
-    if (!column) return;
+  Object.entries(input).forEach(([key, value]) => {
+    const column = map[key];
+    if (!column || value === undefined) return;
     fields.push(`${column} = :${column}`);
-    params[`:${column}`] = key === "isQuickItem" ? (val ? 1 : 0) : val;
+    params[`:${column}`] = key === "isQuickItem" ? (value ? 1 : 0) : value;
   });
   if (!fields.length) return;
-  await run(
-    `UPDATE products SET ${fields.join(", ")}, updated_at = :ts, is_dirty = 1 WHERE id = :id`,
-    params
-  );
+  await run(`UPDATE products SET ${fields.join(", ")}, updated_at = :ts, is_dirty = 1 WHERE id = :id`, params);
 }
 
-export async function deleteProductRecord(id: string) {
-  await run("UPDATE products SET deleted = 1, is_dirty = 1, updated_at = :ts WHERE id = :id", {
-    ":id": id,
-    ":ts": now(),
-  });
+export async function deleteProduct(id: string) {
+  await getDb();
+  await run("DELETE FROM products WHERE id = :id", { ":id": toNumericId(id) });
 }
 
-// ─── Sales ───────────────────────────────────────────────────────────────────
-interface SaleItemRow {
-  id: string;
-  sale_id: string;
-  product_id?: string;
-  name: string;
-  quantity: number;
-  unit?: string;
-  price: number;
-  cost?: number;
-  subtotal: number;
-}
-
+// ─── Sales ─────────────────────────────────────────────────────────────────
 export async function getSales(): Promise<Sale[]> {
-  const sales = await all<any>("SELECT * FROM sales WHERE deleted = 0 ORDER BY timestamp DESC");
-  const items = await all<SaleItemRow>("SELECT * FROM sale_items WHERE deleted = 0");
-  const itemsBySale = items.reduce<Record<string, SaleItemRow[]>>((acc, item) => {
-    acc[item.sale_id] = acc[item.sale_id] || [];
-    acc[item.sale_id].push(item);
+  await getDb();
+  const sales = await queryAll<any>("SELECT * FROM sales ORDER BY timestamp DESC");
+  const items = await queryAll<any>("SELECT * FROM sale_items");
+  const itemsBySale = items.reduce<Record<string, any[]>>((acc, item) => {
+    const key = String(item.sale_id);
+    if (!acc[key]) acc[key] = [];
+    acc[key].push(item);
     return acc;
   }, {});
-  return sales.map(sale => ({
-    id: sale.id,
-    timestamp: new Date(Number(sale.timestamp)).toISOString(),
-    date: new Date(Number(sale.timestamp)).toISOString().split("T")[0],
-    items: (itemsBySale[sale.id] || []).map(it => ({
-      productId: it.product_id,
+
+  return sales.map(row => ({
+    id: String(row.id),
+    timestamp: new Date(Number(row.timestamp)).toISOString(),
+    date: new Date(Number(row.timestamp)).toISOString().split("T")[0],
+    items: (itemsBySale[String(row.id)] || []).map(it => ({
+      productId: it.product_id !== null ? String(it.product_id) : undefined,
       name: it.name,
-      qty: it.quantity,
+      qty: Number(it.quantity),
       unit: (it.unit || "piece") as Unit,
-      price: it.price,
-      cost: it.cost,
-      subtotal: it.subtotal,
+      price: Number(it.price),
+      cost: it.cost !== null ? Number(it.cost) : undefined,
+      subtotal: Number(it.subtotal),
     })),
-    total: Number(sale.total),
-    paymentType: sale.payment_type,
-    isUtang: toBool(sale.is_utang),
-    customerId: sale.customer_id,
+    total: Number(row.total),
+    paymentType: row.payment_type,
+    isUtang: !!row.is_utang,
+    customerId: row.customer_id !== null ? String(row.customer_id) : undefined,
   }));
 }
 
@@ -171,110 +225,124 @@ export async function createSale(input: {
   changeDue?: number;
   timestamp?: number;
 }) {
-  const saleId = input.id || uuid();
+  await getDb();
+  const saleId = toNumericId(input.id);
   const ts = input.timestamp ?? now();
-  await transaction(async db => {
-    db.prepare(
-      `INSERT INTO sales (id, total, payment_type, timestamp, customer_id, is_utang, amount_paid, change_due, updated_at, is_dirty)
-       VALUES (:id, :total, :payment_type, :timestamp, :customer_id, :is_utang, :amount_paid, :change_due, :ts, 1)`
-    ).bind({
-      ":id": saleId,
-      ":total": input.total,
-      ":payment_type": input.paymentType,
-      ":timestamp": ts,
-      ":customer_id": input.customerId || null,
-      ":is_utang": input.isUtang ? 1 : 0,
-      ":amount_paid": input.amountPaid ?? input.total,
-      ":change_due": input.changeDue ?? 0,
-      ":ts": ts,
-    }).step();
 
-    const insertItem = db.prepare(
-      `INSERT INTO sale_items (id, sale_id, product_id, name, quantity, unit, price, cost, subtotal, updated_at, is_dirty)
-       VALUES (:id, :sale_id, :product_id, :name, :quantity, :unit, :price, :cost, :subtotal, :ts, 1)`
+  await runTransaction(async db => {
+    const customerRef = input.customerId
+      ? resolveExistingIdInTx(db as any, "customers", input.customerId)
+      : null;
+
+    db.run(
+      `INSERT INTO sales (id, total, payment_type, timestamp, customer_id, is_utang, amount_paid, change_due, updated_at, is_dirty)
+       VALUES (:id, :total, :payment_type, :timestamp, :customer_id, :is_utang, :amount_paid, :change_due, :ts, 1)`,
+      {
+        ":id": saleId,
+        ":total": input.total,
+        ":payment_type": input.paymentType,
+        ":timestamp": ts,
+        ":customer_id": customerRef?.exists ? customerRef.id : null,
+        ":is_utang": input.isUtang ? 1 : 0,
+        ":amount_paid": input.amountPaid ?? input.total,
+        ":change_due": input.changeDue ?? 0,
+        ":ts": ts,
+      }
     );
 
-    input.items.forEach(item => {
-      insertItem.bind({
-        ":id": uuid(),
-        ":sale_id": saleId,
-        ":product_id": item.productId || null,
-        ":name": item.name,
-        ":quantity": item.qty,
-        ":unit": item.unit || "piece",
-        ":price": item.price,
-        ":cost": item.cost ?? null,
-        ":subtotal": item.subtotal,
-        ":ts": ts,
-      }).step();
-      insertItem.reset();
+    for (const item of input.items) {
+      const itemId = generateId();
+      const productRef = item.productId
+        ? resolveExistingIdInTx(db as any, "products", item.productId)
+        : null;
 
-      if (item.productId) {
-        const productStmt = db.prepare("SELECT conversion, unit FROM products WHERE id = :pid");
-        productStmt.bind({ ":pid": item.productId }).step();
-        const productRow = productStmt.getAsObject() as { conversion?: number; unit?: string };
-        productStmt.free();
-        const factor =
-          item.unit === "pack" || item.unit === "box"
-            ? productRow.conversion || 1
-            : item.unit === "kg" || item.unit === "liters"
-            ? 1000
-            : 1;
-        db.prepare(
-          `UPDATE products SET stock = stock - :qty, updated_at = :ts, is_dirty = 1 WHERE id = :pid`
-        ).bind({ ":qty": item.qty * factor, ":ts": ts, ":pid": item.productId }).step();
+      db.run(
+        `INSERT INTO sale_items (id, sale_id, product_id, name, quantity, unit, price, cost, subtotal, updated_at, is_dirty)
+         VALUES (:id, :sale_id, :product_id, :name, :quantity, :unit, :price, :cost, :subtotal, :ts, 1)`,
+        {
+          ":id": itemId,
+          ":sale_id": saleId,
+          ":product_id": productRef?.exists ? productRef.id : null,
+          ":name": item.name,
+          ":quantity": item.qty,
+          ":unit": item.unit || "piece",
+          ":price": item.price,
+          ":cost": item.cost ?? null,
+          ":subtotal": item.subtotal,
+          ":ts": ts,
+        }
+      );
+
+      if (productRef?.exists) {
+        const rows = execRows(db, "SELECT conversion, unit FROM products WHERE id = :pid", {
+          ":pid": productRef.id,
+        });
+        const product = rows[0] || { conversion: 1, unit: "piece" };
+        const factor = unitFactor(item.unit, product.conversion);
+        db.run(
+          `UPDATE products SET stock = stock - :qty, updated_at = :ts, is_dirty = 1 WHERE id = :pid`,
+          {
+            ":qty": item.qty * factor,
+            ":ts": ts,
+            ":pid": productRef.id,
+          }
+        );
       }
-    });
-    insertItem.free();
+    }
   });
-  return saleId;
+
+  return String(saleId);
 }
 
-// ─── Customers / Utang ──────────────────────────────────────────────────────
+// ─── Customers / Utang ─────────────────────────────────────────────────────
 export async function getCustomers(): Promise<Customer[]> {
-  const customers = await all<any>("SELECT * FROM customers WHERE deleted = 0");
-  const utang = await all<any>("SELECT * FROM utang_records WHERE deleted = 0");
-  const payments = await all<any>("SELECT * FROM utang_payments WHERE deleted = 0");
+  await getDb();
+  const customers = await queryAll<any>("SELECT * FROM customers ORDER BY name ASC");
+  const utang = await queryAll<any>("SELECT * FROM utang_records");
+  const payments = await queryAll<any>("SELECT * FROM utang_payments");
 
   const paymentsByUtang = payments.reduce<Record<string, any[]>>((acc, p) => {
-    acc[p.utang_id] = acc[p.utang_id] || [];
-    acc[p.utang_id].push(p);
+    const key = String(p.utang_id);
+    if (!acc[key]) acc[key] = [];
+    acc[key].push(p);
     return acc;
   }, {});
 
   const utangByCustomer = utang.reduce<Record<string, UtangRecord[]>>((acc, r) => {
     const rec: UtangRecord = {
-      id: r.id,
+      id: String(r.id),
       date: r.date,
       items: r.items_json ? JSON.parse(r.items_json) : [],
       amount: Number(r.amount),
       balance: Number(r.balance),
-      payments: (paymentsByUtang[r.id] || []).map(p => ({
-        id: p.id,
+      payments: (paymentsByUtang[String(r.id)] || []).map(p => ({
+        id: String(p.id),
         amount: Number(p.amount),
         date: p.date,
       })),
     };
-    acc[r.customer_id] = acc[r.customer_id] || [];
-    acc[r.customer_id].push(rec);
+    const custId = String(r.customer_id);
+    if (!acc[custId]) acc[custId] = [];
+    acc[custId].push(rec);
     return acc;
   }, {});
 
   return customers.map(c => ({
-    id: c.id,
+    id: String(c.id),
     name: c.name,
     phone: c.phone || "",
-    transactions: utangByCustomer[c.id] || [],
+    transactions: utangByCustomer[String(c.id)] || [],
   }));
 }
 
 export async function createCustomer(name: string, phone?: string, id?: string) {
-  const customerId = id || uuid();
+  await getDb();
+  const customerId = toNumericId(id);
   await run(
     `INSERT INTO customers (id, name, phone, updated_at, is_dirty) VALUES (:id, :name, :phone, :ts, 1)`,
     { ":id": customerId, ":name": name, ":phone": phone || "", ":ts": now() }
   );
-  return customerId;
+  return String(customerId);
 }
 
 export async function addUtangRecord(data: {
@@ -285,13 +353,19 @@ export async function addUtangRecord(data: {
   balance: number;
   date: string;
 }) {
-  const id = data.id || uuid();
+  await getDb();
+  const id = toNumericId(data.id);
+  const customerRef = await resolveExistingId("customers", data.customerId);
+  if (!customerRef.exists) {
+    throw new Error(`Cannot create utang record: customer not found (${data.customerId})`);
+  }
+
   await run(
     `INSERT INTO utang_records (id, customer_id, amount, balance, date, items_json, updated_at, is_dirty)
      VALUES (:id, :customer_id, :amount, :balance, :date, :items_json, :ts, 1)`,
     {
       ":id": id,
-      ":customer_id": data.customerId,
+      ":customer_id": customerRef.id,
       ":amount": data.amount,
       ":balance": data.balance,
       ":date": data.date,
@@ -299,42 +373,52 @@ export async function addUtangRecord(data: {
       ":ts": now(),
     }
   );
-  return id;
+  return String(id);
 }
 
 export async function recordPayment(utangId: string, amount: number, date: string) {
-  const paymentId = uuid();
+  await getDb();
+  const paymentId = generateId();
   const ts = now();
-  await transaction(db => {
-    db.prepare(
+  const utangRef = await resolveExistingId("utang_records", utangId);
+  if (!utangRef.exists) {
+    throw new Error(`Cannot record payment: utang record not found (${utangId})`);
+  }
+
+  await runTransaction(db => {
+    db.run(
       `INSERT INTO utang_payments (id, utang_id, amount, date, updated_at, is_dirty)
-       VALUES (:id, :utang_id, :amount, :date, :ts, 1)`
-    ).bind({ ":id": paymentId, ":utang_id": utangId, ":amount": amount, ":date": date, ":ts": ts }).step();
-    db.prepare(
-      `UPDATE utang_records SET balance = balance - :amount, updated_at = :ts, is_dirty = 1 WHERE id = :utang_id`
-    ).bind({ ":amount": amount, ":ts": ts, ":utang_id": utangId }).step();
+       VALUES (:id, :utang_id, :amount, :date, :ts, 1)`,
+      { ":id": paymentId, ":utang_id": utangRef.id, ":amount": amount, ":date": date, ":ts": ts }
+    );
+    db.run(
+      `UPDATE utang_records SET balance = balance - :amount, updated_at = :ts, is_dirty = 1 WHERE id = :utang_id`,
+      { ":amount": amount, ":ts": ts, ":utang_id": utangRef.id }
+    );
   });
-  return paymentId;
+  return String(paymentId);
 }
 
-// ─── Pabili Orders ──────────────────────────────────────────────────────────
+// ─── Pabili Orders ─────────────────────────────────────────────────────────
 export async function getPabiliOrders(): Promise<PabiliOrder[]> {
-  const rows = await all<any>("SELECT * FROM pabili_orders WHERE deleted = 0 ORDER BY timestamp DESC");
+  await getDb();
+  const rows = await queryAll<any>("SELECT * FROM pabili_orders ORDER BY timestamp DESC");
   return rows.map(row => ({
-    id: row.id,
+    id: String(row.id),
     customerName: row.customer_name || "Customer",
     customerPhone: row.customer_phone || "",
     items: row.items_json ? JSON.parse(row.items_json) : [],
     status: row.status,
     timestamp: new Date(Number(row.timestamp)).toISOString(),
-    date: new Date(Number(row.timestamp)).toISOString().split("T")[0],
+    date: new Date(Number(row.timestamp)).toISOString(),
     note: row.note || "",
     total: Number(row.total || 0),
   }));
 }
 
 export async function createPabiliOrder(order: Omit<PabiliOrder, "id" | "date"> & { id?: string }) {
-  const id = order.id || uuid();
+  await getDb();
+  const id = toNumericId(order.id);
   const ts = order.timestamp ? new Date(order.timestamp).getTime() : now();
   await run(
     `INSERT INTO pabili_orders (id, items_json, customer_name, customer_phone, status, timestamp, note, total, updated_at, is_dirty)
@@ -351,21 +435,23 @@ export async function createPabiliOrder(order: Omit<PabiliOrder, "id" | "date"> 
       ":ts": ts,
     }
   );
-  return id;
+  return String(id);
 }
 
 export async function updatePabiliStatus(id: string, status: PabiliOrder["status"]) {
+  await getDb();
   await run(
     `UPDATE pabili_orders SET status = :status, updated_at = :ts, is_dirty = 1 WHERE id = :id`,
-    { ":status": status, ":ts": now(), ":id": id }
+    { ":status": status, ":ts": now(), ":id": toNumericId(id) }
   );
 }
 
-// ─── Expenses ───────────────────────────────────────────────────────────────
+// ─── Expenses ──────────────────────────────────────────────────────────────
 export async function getExpenses(): Promise<Expense[]> {
-  const rows = await all<any>("SELECT * FROM expenses WHERE deleted = 0 ORDER BY date DESC");
+  await getDb();
+  const rows = await queryAll<any>("SELECT * FROM expenses ORDER BY date DESC");
   return rows.map(row => ({
-    id: row.id,
+    id: String(row.id),
     date: row.date,
     name: row.name,
     description: row.description || "",
@@ -375,7 +461,8 @@ export async function getExpenses(): Promise<Expense[]> {
 }
 
 export async function addExpense(expense: Omit<Expense, "id"> & { id?: string }) {
-  const id = expense.id || uuid();
+  await getDb();
+  const id = toNumericId(expense.id);
   await run(
     `INSERT INTO expenses (id, name, amount, date, category, description, updated_at, is_dirty)
      VALUES (:id, :name, :amount, :date, :category, :description, :ts, 1)`,
@@ -389,12 +476,13 @@ export async function addExpense(expense: Omit<Expense, "id"> & { id?: string })
       ":ts": now(),
     }
   );
-  return id;
+  return String(id);
 }
 
-// ─── Settings ───────────────────────────────────────────────────────────────
+// ─── Settings ──────────────────────────────────────────────────────────────
 export async function getSettings(): Promise<StoreSettings | null> {
-  const row = await get<any>("SELECT * FROM settings WHERE id = 1");
+  await getDb();
+  const row = await queryOne<any>("SELECT * FROM settings WHERE id = 1");
   if (!row) return null;
   return {
     storeName: row.store_name || "My Sari-Sari Store",
@@ -406,15 +494,16 @@ export async function getSettings(): Promise<StoreSettings | null> {
     gcashNumber: row.gcash_number || "",
     paymayaNumber: row.paymaya_number || "",
     managementPIN: row.management_pin || "0000",
-    isOnboardingComplete: toBool(row.onboarding_complete),
-    enableUtang: toBool(row.enable_utang),
-    enablePabili: toBool(row.enable_pabili),
-    enableBarcodeScanner: toBool(row.enable_barcode_scanner),
-    enableReceiptPrinter: toBool(row.enable_receipt_printer),
+    isOnboardingComplete: !!row.onboarding_complete,
+    enableUtang: row.enable_utang !== 0,
+    enablePabili: row.enable_pabili !== 0,
+    enableBarcodeScanner: row.enable_barcode_scanner !== 0,
+    enableReceiptPrinter: row.enable_receipt_printer !== 0,
   };
 }
 
 export async function saveSettings(settings: StoreSettings) {
+  await getDb();
   await run(
     `INSERT INTO settings (id, store_name, owner_name, address, theme, language, subscription_tier, gcash_number, paymaya_number, management_pin,
       onboarding_complete, enable_utang, enable_pabili, enable_barcode_scanner, enable_receipt_printer, updated_at, is_dirty)
@@ -457,12 +546,14 @@ export async function saveSettings(settings: StoreSettings) {
   );
 }
 
-// ─── Sync helpers ───────────────────────────────────────────────────────────
+// ─── Sync helpers (optional for Supabase sync layer) ───────────────────────
 export async function getDirtyRows(table: Table) {
-  return all<any>(`SELECT * FROM ${table} WHERE is_dirty = 1`);
+  await getDb();
+  return queryAll<any>(`SELECT * FROM ${table} WHERE is_dirty = 1`);
 }
 
 export async function markSynced(table: Table, ids: string[]) {
+  await getDb();
   if (!ids.length) return;
   const placeholders = ids.map((_, idx) => `:id${idx}`).join(", ");
   const params = ids.reduce<Record<string, any>>((acc, id, idx) => {
@@ -473,25 +564,30 @@ export async function markSynced(table: Table, ids: string[]) {
 }
 
 export async function upsertRemote(table: Table, rows: any[]) {
+  await getDb();
   if (!rows.length) return;
-  await transaction(db => {
+  await runTransaction(db => {
     rows.forEach(row => {
       const cols = Object.keys(row);
       const placeholders = cols.map(c => `:${c}`).join(", ");
       const updates = cols.filter(c => c !== "id").map(c => `${c} = excluded.${c}`).join(", ");
-      const stmt = db.prepare(
-        `INSERT INTO ${table} (${cols.join(", ")}) VALUES (${placeholders})
-         ON CONFLICT(id) DO UPDATE SET ${updates}`
-      );
       const params: Record<string, any> = {};
       cols.forEach(c => { params[`:${c}`] = row[c]; });
-      stmt.bind(params).step();
-      stmt.free();
+      db.run(
+        `INSERT INTO ${table} (${cols.join(", ")}) VALUES (${placeholders})
+         ON CONFLICT(id) DO UPDATE SET ${updates}`,
+        params
+      );
     });
   });
 }
 
 export async function latestUpdate(table: Table) {
-  const row = await get<{ max_ts: number }>(`SELECT MAX(updated_at) as max_ts FROM ${table}`);
+  await getDb();
+  const row = await queryOne<{ max_ts: number }>(`SELECT MAX(updated_at) as max_ts FROM ${table}`);
   return row?.max_ts || 0;
 }
+
+// Legacy aliases kept for backward compatibility with existing callers
+export const updateProductRecord = updateProduct;
+export const deleteProductRecord = deleteProduct;

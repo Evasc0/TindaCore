@@ -1,6 +1,7 @@
 import { BrowserMultiFormatReader, Result } from "@zxing/browser";
 
 const reader = new BrowserMultiFormatReader();
+let controls: { stop: () => void } | null = null;
 
 export async function startScanner(
   videoElement: HTMLVideoElement,
@@ -9,7 +10,8 @@ export async function startScanner(
   deviceId?: string
 ) {
   try {
-    await reader.decodeFromVideoDevice(deviceId, videoElement, (result: Result | undefined, err) => {
+    controls?.stop();
+    controls = await reader.decodeFromVideoDevice(deviceId, videoElement, (result: Result | undefined, err) => {
       if (result) onResult(result.getText());
       if (err && onError) onError(err);
     });
@@ -20,7 +22,8 @@ export async function startScanner(
 }
 
 export function stopScanner() {
-  reader.reset();
+  controls?.stop();
+  controls = null;
 }
 
 export async function scanBarcode(imageUrl: string): Promise<string | null> {

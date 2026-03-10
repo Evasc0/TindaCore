@@ -832,6 +832,8 @@ interface StoreContextType {
 
 const StoreContext = createContext<StoreContextType | null>(null);
 
+const newId = () => `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+
 // ─── Initial data ──────────────────────────────────────────────────────────────
 const seedProducts = [
   { id: "p1", name: "Coke Mismo", price: 15, cost: 10, stock: 48, barcode: "4800888114919", category: "Beverages", isQuickItem: true, emoji: "🥤" },
@@ -1189,7 +1191,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       : unit === "kg" || unit === "liters"
       ? (p.stock || 0) * 1000
       : p.stock || 0;
-    const id = crypto.randomUUID ? crypto.randomUUID() : `p${Date.now()}`;
+    const id = newId();
     const product: Product = { ...p, id, unit, baseUnit, conversion, stock: stockBase };
     setProducts(prev => [...prev, product]);
     void persistProduct(product);
@@ -1315,7 +1317,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const completeSale = useCallback((amountPaid: number, method = "cash") => {
     if (cart.length === 0) return;
     const now = new Date();
-    const saleId = crypto.randomUUID ? crypto.randomUUID() : `s${Date.now()}`;
+    const saleId = newId();
     const saleItems = cart.map(i => {
       const product = products.find(p => p.id === i.productId);
       return {
@@ -1360,8 +1362,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     if (cart.length === 0) return;
     const now = new Date();
     const nowStr = now.toISOString();
-    const saleId = crypto.randomUUID ? crypto.randomUUID() : `s${Date.now()}`;
-    const utangId = crypto.randomUUID ? crypto.randomUUID() : `t${Date.now()}`;
+    const saleId = newId();
+    const utangId = newId();
     const items = cart.map(i => ({
       productId: i.productId,
       name: i.productName,
@@ -1430,7 +1432,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   // Customers
   const addCustomer = useCallback((name: string, phone?: string) => {
-    const id = crypto.randomUUID ? crypto.randomUUID() : `c${Date.now()}`;
+    const id = newId();
     setCustomers(prev => [...prev, { id, name, phone, transactions: [] }]);
     void persistCustomer(name, phone, id);
     void syncAll().catch(() => {});
@@ -1460,7 +1462,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   // Pabili
   const addPabiliOrder = useCallback((order: Omit<PabiliOrder, "id">) => {
-    const id = crypto.randomUUID ? crypto.randomUUID() : `pab${Date.now()}`;
+    const id = newId();
     const timestamp = order.timestamp || order.date || new Date().toISOString();
     const newOrder = { ...order, id, timestamp };
     setPabiliOrders(prev => [newOrder, ...prev]);
@@ -1540,7 +1542,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   // Expenses
   const addExpense = useCallback((e: Omit<Expense, "id">) => {
-    const id = crypto.randomUUID ? crypto.randomUUID() : `exp${Date.now()}`;
+    const id = newId();
     const expense = { ...e, id };
     setExpenses(prev => [...prev, expense]);
     void persistExpense(expense);

@@ -1,15 +1,18 @@
-import initSqlJs, { Database } from "sql.js";
+import initSqlJs, { type Database } from "sql.js";
 import wasmUrl from "sql.js/dist/sql-wasm.wasm?url";
 
 const DB_STORAGE_KEY = "tindacore.sqlite";
+const PERSIST_DEBOUNCE_MS = 200;
 
 let dbPromise: Promise<Database> | null = null;
 let persistTimer: number | undefined;
 
-const createStatements: string[] = [
-  `PRAGMA foreign_keys = ON;`,
+type QueryExecResult = { columns: string[]; values: any[][] };
+
+const schemaStatements = [
+  "PRAGMA foreign_keys = ON;",
   `CREATE TABLE IF NOT EXISTS products (
-    id TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     barcode TEXT,
     price REAL NOT NULL,
@@ -22,26 +25,24 @@ const createStatements: string[] = [
     is_quick_item INTEGER DEFAULT 0,
     emoji TEXT,
     updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
-    is_dirty INTEGER DEFAULT 1,
-    deleted INTEGER DEFAULT 0
+    is_dirty INTEGER DEFAULT 0
   );`,
   `CREATE TABLE IF NOT EXISTS sales (
-    id TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
     total REAL NOT NULL,
     payment_type TEXT NOT NULL,
     timestamp INTEGER NOT NULL,
-    customer_id TEXT,
+    customer_id INTEGER,
     is_utang INTEGER DEFAULT 0,
     amount_paid REAL DEFAULT 0,
     change_due REAL DEFAULT 0,
     updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
-    is_dirty INTEGER DEFAULT 1,
-    deleted INTEGER DEFAULT 0
+    is_dirty INTEGER DEFAULT 0
   );`,
   `CREATE TABLE IF NOT EXISTS sale_items (
-    id TEXT PRIMARY KEY,
-    sale_id TEXT NOT NULL,
-    product_id TEXT,
+    id INTEGER PRIMARY KEY,
+    sale_id INTEGER NOT NULL,
+    product_id INTEGER,
     name TEXT,
     quantity REAL NOT NULL,
     unit TEXT,
@@ -49,42 +50,38 @@ const createStatements: string[] = [
     cost REAL,
     subtotal REAL NOT NULL,
     updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
-    is_dirty INTEGER DEFAULT 1,
-    deleted INTEGER DEFAULT 0,
+    is_dirty INTEGER DEFAULT 0,
     FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE
   );`,
   `CREATE TABLE IF NOT EXISTS customers (
-    id TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     phone TEXT,
     updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
-    is_dirty INTEGER DEFAULT 1,
-    deleted INTEGER DEFAULT 0
+    is_dirty INTEGER DEFAULT 0
   );`,
   `CREATE TABLE IF NOT EXISTS utang_records (
-    id TEXT PRIMARY KEY,
-    customer_id TEXT NOT NULL,
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER NOT NULL,
     amount REAL NOT NULL,
     balance REAL NOT NULL,
     date TEXT NOT NULL,
     items_json TEXT,
     updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
-    is_dirty INTEGER DEFAULT 1,
-    deleted INTEGER DEFAULT 0,
+    is_dirty INTEGER DEFAULT 0,
     FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
   );`,
   `CREATE TABLE IF NOT EXISTS utang_payments (
-    id TEXT PRIMARY KEY,
-    utang_id TEXT NOT NULL,
+    id INTEGER PRIMARY KEY,
+    utang_id INTEGER NOT NULL,
     amount REAL NOT NULL,
     date TEXT NOT NULL,
     updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
-    is_dirty INTEGER DEFAULT 1,
-    deleted INTEGER DEFAULT 0,
+    is_dirty INTEGER DEFAULT 0,
     FOREIGN KEY (utang_id) REFERENCES utang_records(id) ON DELETE CASCADE
   );`,
   `CREATE TABLE IF NOT EXISTS pabili_orders (
-    id TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
     items_json TEXT NOT NULL,
     customer_name TEXT,
     customer_phone TEXT,
@@ -93,19 +90,17 @@ const createStatements: string[] = [
     note TEXT,
     total REAL DEFAULT 0,
     updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
-    is_dirty INTEGER DEFAULT 1,
-    deleted INTEGER DEFAULT 0
+    is_dirty INTEGER DEFAULT 0
   );`,
   `CREATE TABLE IF NOT EXISTS expenses (
-    id TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     amount REAL NOT NULL,
     date TEXT NOT NULL,
     category TEXT,
     description TEXT,
     updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
-    is_dirty INTEGER DEFAULT 1,
-    deleted INTEGER DEFAULT 0
+    is_dirty INTEGER DEFAULT 0
   );`,
   `CREATE TABLE IF NOT EXISTS settings (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -124,7 +119,7 @@ const createStatements: string[] = [
     enable_barcode_scanner INTEGER DEFAULT 1,
     enable_receipt_printer INTEGER DEFAULT 0,
     updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
-    is_dirty INTEGER DEFAULT 1
+    is_dirty INTEGER DEFAULT 0
   );`,
   `CREATE TABLE IF NOT EXISTS sync_state (
     table_name TEXT PRIMARY KEY,
@@ -150,21 +145,29 @@ const fromBase64 = (str: string) => {
   return bytes;
 };
 
-async function persist(db: Database) {
+function mapResult(result: QueryExecResult[]): any[] {
+  if (!result.length) return [];
+  const { columns, values } = result[0];
+  return values.map(row => {
+    const obj: Record<string, any> = {};
+    columns.forEach((col, idx) => {
+      obj[col] = row[idx];
+    });
+    return obj;
+  });
+}
+
+function createTables(db: Database) {
+  schemaStatements.forEach(sql => db.exec(sql));
+}
+
+async function schedulePersist(db: Database) {
   if (typeof window === "undefined") return;
-  if (persistTimer) {
-    window.clearTimeout(persistTimer);
-  }
+  if (persistTimer) window.clearTimeout(persistTimer);
   persistTimer = window.setTimeout(() => {
     const data = db.export();
     localStorage.setItem(DB_STORAGE_KEY, toBase64(data));
-  }, 200);
-}
-
-function initSchema(db: Database) {
-  db.exec("BEGIN;");
-  createStatements.forEach(sql => db.exec(sql));
-  db.exec("COMMIT;");
+  }, PERSIST_DEBOUNCE_MS);
 }
 
 export async function getDatabase(): Promise<Database> {
@@ -173,51 +176,61 @@ export async function getDatabase(): Promise<Database> {
       const SQL = await initSqlJs({ locateFile: () => wasmUrl });
       const stored = typeof window !== "undefined" ? localStorage.getItem(DB_STORAGE_KEY) : null;
       const db = stored ? new SQL.Database(fromBase64(stored)) : new SQL.Database();
-      initSchema(db);
+      createTables(db);
       return db;
     })();
   }
   return dbPromise;
 }
 
+export async function initializeDatabase() {
+  await getDatabase();
+}
+
 export async function run(sql: string, params?: Record<string, any> | any[]) {
   const db = await getDatabase();
-  const stmt = db.prepare(sql);
-  if (params) stmt.bind(params as any);
-  stmt.step();
-  stmt.free();
-  await persist(db);
-}
-
-export async function all<T = any>(sql: string, params?: Record<string, any> | any[]): Promise<T[]> {
-  const db = await getDatabase();
-  const stmt = db.prepare(sql);
-  if (params) stmt.bind(params as any);
-  const rows: T[] = [];
-  while (stmt.step()) {
-    rows.push(stmt.getAsObject() as T);
+  try {
+    db.run(sql, params as any);
+    await schedulePersist(db);
+  } catch (err) {
+    console.error("SQLite run failed", err);
+    throw err;
   }
-  stmt.free();
-  return rows;
 }
 
-export async function get<T = any>(sql: string, params?: Record<string, any> | any[]): Promise<T | undefined> {
-  const rows = await all<T>(sql, params);
+export async function queryAll<T = any>(sql: string, params?: Record<string, any> | any[]): Promise<T[]> {
+  const db = await getDatabase();
+  try {
+    const result = db.exec(sql, params as any);
+    return mapResult(result) as T[];
+  } catch (err) {
+    console.error("SQLite queryAll failed", err);
+    return [];
+  }
+}
+
+export async function queryOne<T = any>(sql: string, params?: Record<string, any> | any[]): Promise<T | undefined> {
+  const rows = await queryAll<T>(sql, params);
   return rows[0];
 }
 
-export async function transaction(callback: (db: Database) => void | Promise<void>) {
+export async function runTransaction<T>(callback: (db: Database) => T | Promise<T>): Promise<T> {
   const db = await getDatabase();
-  db.exec("BEGIN;");
+  db.exec("BEGIN");
   try {
-    await callback(db);
-    db.exec("COMMIT;");
+    const result = await callback(db);
+    db.exec("COMMIT");
+    await schedulePersist(db);
+    return result;
   } catch (err) {
-    db.exec("ROLLBACK;");
+    db.exec("ROLLBACK");
+    console.error("SQLite transaction failed", err);
     throw err;
-  } finally {
-    await persist(db);
   }
+}
+
+export function execRows(db: Database, sql: string, params?: Record<string, any>): any[] {
+  return mapResult(db.exec(sql, params as any));
 }
 
 export async function setSyncMarker(table: string, timestamp: number) {
@@ -230,7 +243,7 @@ export async function setSyncMarker(table: string, timestamp: number) {
 }
 
 export async function getSyncMarker(table: string) {
-  const row = await get<{ last_synced_at: number }>(
+  const row = await queryOne<{ last_synced_at: number }>(
     "SELECT last_synced_at FROM sync_state WHERE table_name = :table",
     { ":table": table }
   );
