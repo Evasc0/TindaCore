@@ -1,9 +1,10 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 import { Bell, QrCode, Check, X, ShoppingCart, Clock, AlertCircle, Download, Printer, Zap, Star, Send, Plus, Minus } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import { useStore, canAccess } from "../context/StoreContext";
 import { TierBadge, TierGate, UpgradeBanner } from "./TierComponents";
+import { buildOrderingLink, generateStoreQr } from "../utils/qrGenerator";
 
 type Tab = "orders" | "qr" | "customer";
 
@@ -13,6 +14,8 @@ export function SmartPabiliScreen() {
   const isDark = settings.theme === "dark";
   const sub = settings.subscription;
   const [tab, setTab] = useState<Tab>("orders");
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+  const [qrLoading, setQrLoading] = useState(false);
 
   const card = isDark ? "#1f2937" : "#ffffff";
   const cardBorder = isDark ? "#374151" : "#f3f4f6";
@@ -24,7 +27,41 @@ export function SmartPabiliScreen() {
   const preparing = pabiliOrders.filter(o => o.status === "preparing");
   const done = pabiliOrders.filter(o => o.status === "done" || o.status === "dismissed");
 
-  const storeQRValue = `https://sari-sari-pos.app/pabili/${settings.storeName.replace(/\s+/g, "-").toLowerCase()}`;
+  const storeSlug = (settings.storeName || "store").replace(/\s+/g, "-").toLowerCase();
+  const orderingUrl = buildOrderingLink(storeSlug);
+  const storeQRValue = JSON.stringify({ storeId: storeSlug, orderingUrl });
+
+  useEffect(() => {
+    let cancelled = false;
+    const buildQr = async () => {
+      setQrLoading(true);
+      try {
+        const dataUrl = await generateStoreQr({ storeId: storeSlug, orderingUrl });
+        if (!cancelled) setQrDataUrl(dataUrl);
+      } finally {
+        if (!cancelled) setQrLoading(false);
+      }
+    };
+    buildQr();
+    return () => { cancelled = true; };
+  }, [storeSlug, orderingUrl]);
+
+  const handleDownloadQR = () => {
+    if (!qrDataUrl) return;
+    const link = document.createElement("a");
+    link.href = qrDataUrl;
+    link.download = `tindacore-qr.png`;
+    link.click();
+  };
+
+  const handlePrintQR = () => {
+    if (!qrDataUrl) return;
+    const w = window.open("");
+    if (!w) return;
+    w.document.write(`<img src="${qrDataUrl}" style="width:280px;height:280px;" />`);
+    w.print();
+    w.close();
+  };
 
   const handleOpenInPOS = (order: (typeof pabiliOrders)[0]) => {
     if (canAccess(sub, "premium") && order.items.length > 0) {
@@ -190,11 +227,21 @@ export function SmartPabiliScreen() {
 
             {/* Action buttons */}
             <div className="flex gap-2 w-full">
-              <button className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl font-semibold text-sm" style={{ background: "linear-gradient(135deg, #7c3aed, #6d28d9)", color: "#fff" }}>
+              <button
+                onClick={handleDownloadQR}
+                disabled={qrLoading}
+                className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl font-semibold text-sm disabled:opacity-50"
+                style={{ background: "linear-gradient(135deg, #7c3aed, #6d28d9)", color: "#fff" }}
+              >
                 <Download size={15} />
                 {t.downloadQR}
               </button>
-              <button className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl border font-semibold text-sm" style={{ borderColor: cardBorder, color: textMuted }}>
+              <button
+                onClick={handlePrintQR}
+                disabled={qrLoading}
+                className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl border font-semibold text-sm disabled:opacity-50"
+                style={{ borderColor: cardBorder, color: textMuted }}
+              >
                 <Printer size={15} />
                 {t.printQR}
               </button>

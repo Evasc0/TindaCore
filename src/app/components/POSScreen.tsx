@@ -1,7 +1,8 @@
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import { useNavigate } from "react-router";
 import { Scan, Plus, Minus, Trash2, X, CheckCircle, Zap, Search } from "lucide-react";
 import { useStore } from "../context/StoreContext";
+import { startScanner, stopScanner } from "../hardware/barcodeScanner";
 
 type Mode = "cart" | "complete" | "utang_select";
 
@@ -17,9 +18,11 @@ export function POSScreen() {
   const [showSuccess, setShowSuccess] = useState(false);
   const [selectedCartItem, setSelectedCartItem] = useState<string | null>(null);
   const [scanFlash, setScanFlash] = useState(false);
+  const [scanning, setScanning] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState<"cash" | "gcash" | "paymaya">("cash");
   const [searchTerm, setSearchTerm] = useState("");
   const barcodeRef = useRef<HTMLInputElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
 
   const quickItems = products.filter(p => p.isQuickItem);
   const change = parseFloat(paymentInput || "0") - cartTotal;
@@ -56,6 +59,32 @@ export function POSScreen() {
       setTimeout(() => setScanFlash(false), 500);
     }
   };
+
+  const handleScanResult = (code: string) => {
+    setBarcodeInput(code);
+    const found = products.find(p => p.barcode === code);
+    if (found) {
+      addToCart(found.id);
+      setScanFlash(true);
+      setTimeout(() => setScanFlash(false), 500);
+    }
+  };
+
+  const handleStartScan = async () => {
+    if (!settings.enableBarcodeScanner) return;
+    if (!videoRef.current) return;
+    setScanning(true);
+    await startScanner(videoRef.current, handleScanResult, () => {}, undefined);
+  };
+
+  const handleStopScan = () => {
+    stopScanner();
+    setScanning(false);
+  };
+
+  useEffect(() => {
+    return () => handleStopScan();
+  }, []);
 
   const handleCompleteSale = () => {
     completeSale(parseFloat(paymentInput || "0"), paymentMethod);
@@ -306,6 +335,7 @@ export function POSScreen() {
           className={`relative rounded-2xl overflow-hidden flex items-center justify-center transition-all ${scanFlash ? "ring-2 ring-green-400" : ""}`}
           style={{ height: "80px", background: "#0f172a" }}
         >
+          <video ref={videoRef} className="absolute inset-0 opacity-0 pointer-events-none" muted playsInline />
           <div className="relative z-10 flex items-center gap-3 w-full px-4">
             <div className="w-9 h-9 bg-blue-600 rounded-xl flex items-center justify-center flex-shrink-0">
               <Scan size={18} className="text-white" />
@@ -320,6 +350,13 @@ export function POSScreen() {
               className="flex-1 bg-transparent text-white outline-none text-sm"
               style={{ color: "white" }}
             />
+            <button
+              onClick={scanning ? handleStopScan : handleStartScan}
+              className="px-3 py-1.5 rounded-lg text-xs font-semibold border"
+              style={{ borderColor: "#1d4ed8", color: "#e0e7ff", background: scanning ? "#1d4ed8" : "transparent" }}
+            >
+              {scanning ? "Stop" : "Cam"}
+            </button>
             {barcodeInput && (
               <button onClick={handleBarcodeSearch} className="bg-green-500 text-white px-3 py-1.5 rounded-lg text-xs font-semibold">
                 Add

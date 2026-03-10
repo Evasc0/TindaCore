@@ -1,4 +1,25 @@
-import React, { createContext, useContext, useState, useCallback, useMemo } from "react";
+import React, { createContext, useContext, useState, useCallback, useMemo, useEffect } from "react";
+import {
+  initializeDatabase,
+  getProducts as loadProducts,
+  createProduct as persistProduct,
+  updateProductRecord,
+  deleteProductRecord,
+  createSale as persistSale,
+  getSales as loadSales,
+  createCustomer as persistCustomer,
+  addUtangRecord as persistUtangRecord,
+  recordPayment as persistPayment,
+  createPabiliOrder as persistPabiliOrder,
+  updatePabiliStatus as persistPabiliStatus,
+  addExpense as persistExpense,
+  getExpenses as loadExpenses,
+  getCustomers as loadCustomers,
+  getPabiliOrders as loadPabiliOrders,
+  saveSettings as persistSettings,
+  getSettings as loadSettings,
+} from "../services/databaseService";
+import { syncAll } from "../sync/syncService";
 
 export type Unit = "piece" | "pack" | "box" | "kg" | "grams" | "ml" | "liters";
 type BaseUnit = "piece" | "grams" | "ml";
@@ -965,8 +986,94 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const t = translations[settings.language];
   const cartTotal = cart.reduce((sum, item) => sum + item.subtotal, 0);
 
+  const seedInitialData = useCallback(async () => {
+    await Promise.all(initialProducts.map(p => persistProduct(p)));
+    for (const customer of initialCustomers) {
+      await persistCustomer(customer.name, customer.phone, customer.id);
+      for (const tx of customer.transactions) {
+        await persistUtangRecord({
+          id: tx.id,
+          customerId: customer.id,
+          items: tx.items,
+          amount: tx.amount,
+          balance: tx.balance,
+          date: tx.date,
+        });
+      }
+    }
+    for (const sale of initialSales) {
+      await persistSale({
+        id: sale.id,
+        items: sale.items,
+        total: sale.total,
+        paymentType: sale.paymentType,
+        isUtang: sale.isUtang,
+        customerId: sale.customerId,
+        timestamp: new Date(sale.timestamp).getTime(),
+      });
+    }
+    for (const order of initialPabiliOrders) {
+      await persistPabiliOrder({
+        id: order.id,
+        items: order.items,
+        customerName: order.customerName,
+        customerPhone: order.customerPhone,
+        status: order.status,
+        timestamp: new Date(order.date || order.timestamp).getTime(),
+        note: order.note,
+        total: order.total,
+      });
+    }
+    for (const exp of initialExpenses) {
+      await persistExpense(exp);
+    }
+    await persistSettings(initialSettings);
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const hydrate = async () => {
+      await initializeDatabase();
+      let savedSettings = await loadSettings();
+      if (!savedSettings) {
+        await seedInitialData();
+        savedSettings = initialSettings;
+      }
+      const [dbProducts, dbCustomers, dbSales, dbPabili, dbExpenses] = await Promise.all([
+        loadProducts(),
+        loadCustomers(),
+        loadSales(),
+        loadPabiliOrders(),
+        loadExpenses(),
+      ]);
+      if (!dbProducts.length) {
+        await seedInitialData();
+      }
+      if (!active) return;
+      setSettings(savedSettings || initialSettings);
+      setProducts(dbProducts.length ? dbProducts : initialProducts);
+      setCustomers(dbCustomers.length ? dbCustomers : initialCustomers);
+      setSales(dbSales.length ? dbSales : initialSales);
+      setPabiliOrders(dbPabili.length ? dbPabili : initialPabiliOrders);
+      setExpenses(dbExpenses.length ? dbExpenses : initialExpenses);
+      await syncAll().catch(err => console.debug("Initial sync skipped", err));
+    };
+    hydrate();
+    const interval = typeof window !== "undefined"
+      ? window.setInterval(() => { syncAll().catch(() => {}); }, 5 * 60 * 1000)
+      : null;
+    return () => {
+      active = false;
+      if (interval) window.clearInterval(interval);
+    };
+  }, [seedInitialData]);
+
   const updateSettings = useCallback((s: Partial<StoreSettings>) => {
-    setSettings(prev => ({ ...prev, ...s }));
+    setSettings(prev => {
+      const next = { ...prev, ...s };
+      void persistSettings(next);
+      return next;
+    });
   }, []);
 
   // Mode management
@@ -1001,8 +1108,21 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       enableReceiptPrinter: data.enableReceiptPrinter ?? false,
       subscription: data.subscription ?? prev.subscription,
     }));
+    void persistSettings({
+      ...settings,
+      storeName: data.storeName,
+      ownerName: data.ownerName,
+      address: data.address || settings.address,
+      managementPIN: data.pin,
+      isOnboardingComplete: true,
+      enableUtang: data.enableUtang ?? true,
+      enablePabili: data.enablePabili ?? true,
+      enableBarcodeScanner: data.enableBarcodeScanner ?? true,
+      enableReceiptPrinter: data.enableReceiptPrinter ?? false,
+      subscription: data.subscription ?? settings.subscription,
+    });
     setIsManagementMode(true);
-  }, []);
+  }, [settings]);
 
   const setOperatingUser = useCallback((name: string) => {
     setOperatingUserState(name);
@@ -1018,20 +1138,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       : unit === "kg" || unit === "liters"
       ? (p.stock || 0) * 1000
       : p.stock || 0;
-    setProducts(prev => [
-      ...prev,
-      {
-        ...p,
-        id: `p${Date.now()}`,
-        unit,
-        baseUnit,
-        conversion,
-        stock: stockBase,
-      },
-    ]);
+    const id = crypto.randomUUID ? crypto.randomUUID() : `p${Date.now()}`;
+    const product: Product = { ...p, id, unit, baseUnit, conversion, stock: stockBase };
+    setProducts(prev => [...prev, product]);
+    void persistProduct(product);
+    void syncAll().catch(() => {});
   }, []);
 
   const updateProduct = useCallback((id: string, p: Partial<Product>) => {
+    let updated: Product | null = null;
     setProducts(prev => prev.map(x => {
       if (x.id !== id) return x;
       const unit = p.unit || x.unit;
@@ -1045,12 +1160,19 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         : unit === "kg" || unit === "liters"
         ? stockProvided * 1000
         : stockProvided;
-      return { ...x, ...p, unit, baseUnit, conversion, stock: stockBase };
+      updated = { ...x, ...p, unit, baseUnit, conversion, stock: stockBase };
+      return updated;
     }));
+    if (updated) {
+      void updateProductRecord(id, updated);
+      void syncAll().catch(() => {});
+    }
   }, []);
 
   const addStock = useCallback((productId: string, qty: number, unit?: Unit) => {
     if (qty <= 0) return;
+    const product = products.find(p => p.id === productId);
+    if (!product) return;
     setProducts(prev => prev.map(p => {
       if (p.id !== productId) return p;
       const targetUnit = unit || p.unit;
@@ -1062,10 +1184,21 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           : 1;
       return { ...p, stock: p.stock + qty * factor };
     }));
-  }, []);
+    const factor =
+      (unit || product.unit) === "pack" || (unit || product.unit) === "box"
+        ? product.conversion || 1
+        : (unit || product.unit) === "kg" || (unit || product.unit) === "liters"
+        ? 1000
+        : 1;
+    const updatedStock = product.stock + qty * factor;
+    void updateProductRecord(productId, { stock: updatedStock });
+    void syncAll().catch(() => {});
+  }, [products]);
 
   const deleteProduct = useCallback((id: string) => {
     setProducts(prev => prev.filter(x => x.id !== id));
+    void deleteProductRecord(id);
+    void syncAll().catch(() => {});
   }, []);
 
   const searchProducts = useCallback((query: string) => {
@@ -1130,23 +1263,25 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   // Sales
   const completeSale = useCallback((amountPaid: number, method = "cash") => {
     if (cart.length === 0) return;
-    const now = new Date().toISOString();
+    const now = new Date();
+    const saleId = crypto.randomUUID ? crypto.randomUUID() : `s${Date.now()}`;
+    const saleItems = cart.map(i => {
+      const product = products.find(p => p.id === i.productId);
+      return {
+        productId: i.productId,
+        name: i.productName,
+        qty: i.quantity,
+        unit: i.unit,
+        price: i.price,
+        cost: product?.cost ?? i.price * 0.65,
+        subtotal: i.subtotal,
+      };
+    });
     setSales(prev => [{
-      id: `s${Date.now()}`,
-      timestamp: now,
-      date: now,
-      items: cart.map(i => {
-        const product = products.find(p => p.id === i.productId);
-        return {
-          productId: i.productId,
-          name: i.productName,
-          qty: i.quantity,
-          unit: i.unit,
-          price: i.price,
-          cost: product?.cost ?? i.price * 0.65,
-          subtotal: i.subtotal,
-        };
-      }),
+      id: saleId,
+      timestamp: now.toISOString(),
+      date: now.toISOString(),
+      items: saleItems,
       total: cartTotal,
       paymentType: method as Sale["paymentType"],
       isUtang: false,
@@ -1157,30 +1292,44 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       return ci ? { ...p, stock: Math.max(0, p.stock - toBaseUnits(p, ci.quantity)) } : p;
     }));
     setCart([]);
+    void persistSale({
+      id: saleId,
+      items: saleItems,
+      total: cartTotal,
+      paymentType: method as Sale["paymentType"],
+      isUtang: false,
+      amountPaid,
+      changeDue: amountPaid - cartTotal,
+      timestamp: now.getTime(),
+    });
+    void syncAll().catch(() => {});
   }, [cart, cartTotal, operatingUser, products]);
 
   const addUtangSale = useCallback((customerId: string) => {
     if (cart.length === 0) return;
     const now = new Date();
     const nowStr = now.toISOString();
+    const saleId = crypto.randomUUID ? crypto.randomUUID() : `s${Date.now()}`;
+    const utangId = crypto.randomUUID ? crypto.randomUUID() : `t${Date.now()}`;
+    const items = cart.map(i => ({
+      productId: i.productId,
+      name: i.productName,
+      qty: i.quantity,
+      unit: i.unit,
+      price: i.price,
+      subtotal: i.subtotal,
+    }));
     const newTx: UtangRecord = {
-      id: `t${Date.now()}`,
+      id: utangId,
       date: nowStr.split("T")[0],
       customerId,
-      items: cart.map(i => ({
-        productId: i.productId,
-        name: i.productName,
-        qty: i.quantity,
-        unit: i.unit,
-        price: i.price,
-        subtotal: i.subtotal,
-      })),
+      items,
       amount: cartTotal,
       balance: cartTotal,
       payments: [],
     };
     setSales(prev => [{
-      id: `s${Date.now()}`,
+      id: saleId,
       timestamp: nowStr,
       date: nowStr,
       items: cart.map(i => ({
@@ -1205,11 +1354,35 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       return ci ? { ...p, stock: Math.max(0, p.stock - toBaseUnits(p, ci.quantity)) } : p;
     }));
     setCart([]);
+    void persistSale({
+      id: saleId,
+      items: items.map(item => {
+        const product = products.find(p => p.id === item.productId);
+        return { ...item, cost: product?.cost ?? item.price * 0.65 };
+      }),
+      total: cartTotal,
+      paymentType: "utang",
+      isUtang: true,
+      customerId,
+      timestamp: now.getTime(),
+    });
+    void persistUtangRecord({
+      id: utangId,
+      customerId,
+      items,
+      amount: cartTotal,
+      balance: cartTotal,
+      date: nowStr.split("T")[0],
+    });
+    void syncAll().catch(() => {});
   }, [cart, cartTotal, customers, operatingUser, products]);
 
   // Customers
   const addCustomer = useCallback((name: string, phone?: string) => {
-    setCustomers(prev => [...prev, { id: `c${Date.now()}`, name, phone, transactions: [] }]);
+    const id = crypto.randomUUID ? crypto.randomUUID() : `c${Date.now()}`;
+    setCustomers(prev => [...prev, { id, name, phone, transactions: [] }]);
+    void persistCustomer(name, phone, id);
+    void syncAll().catch(() => {});
   }, []);
   const recordPayment = useCallback((customerId: string, txId: string, amount: number) => {
     if (amount <= 0) return;
@@ -1225,6 +1398,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         };
       }),
     } : c));
+    void persistPayment(txId, amount, new Date().toISOString());
+    void syncAll().catch(() => {});
   }, []);
   const getCustomerBalance = useCallback((customerId: string) => {
     const c = customers.find(x => x.id === customerId);
@@ -1234,14 +1409,26 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   // Pabili
   const addPabiliOrder = useCallback((order: Omit<PabiliOrder, "id">) => {
-    setPabiliOrders(prev => [{
-      ...order,
-      id: `pab${Date.now()}`,
-      timestamp: order.timestamp || order.date || new Date().toISOString(),
-    }, ...prev]);
+    const id = crypto.randomUUID ? crypto.randomUUID() : `pab${Date.now()}`;
+    const timestamp = order.timestamp || order.date || new Date().toISOString();
+    const newOrder = { ...order, id, timestamp };
+    setPabiliOrders(prev => [newOrder, ...prev]);
+    void persistPabiliOrder({
+      id,
+      items: order.items,
+      customerName: order.customerName,
+      customerPhone: order.customerPhone,
+      status: order.status,
+      timestamp: new Date(timestamp).getTime(),
+      note: order.note,
+      total: order.total,
+    });
+    void syncAll().catch(() => {});
   }, []);
   const updatePabiliStatus = useCallback((id: string, status: PabiliOrder["status"]) => {
     setPabiliOrders(prev => prev.map(o => o.id === id ? { ...o, status } : o));
+    void persistPabiliStatus(id, status);
+    void syncAll().catch(() => {});
   }, []);
 
   // Restock
@@ -1255,12 +1442,22 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         if (p.id !== productId) return p;
         return { ...p, stock: p.stock + toBaseUnits(p, purchasedQty) };
       }));
+      const product = products.find(p => p.id === productId);
+      if (product) {
+        const updatedStock = product.stock + toBaseUnits(product, purchasedQty);
+        void updateProductRecord(productId, { stock: updatedStock });
+        void syncAll().catch(() => {});
+      }
     }
-  }, []);
+  }, [products]);
 
   // Expenses
   const addExpense = useCallback((e: Omit<Expense, "id">) => {
-    setExpenses(prev => [...prev, { ...e, id: `exp${Date.now()}` }]);
+    const id = crypto.randomUUID ? crypto.randomUUID() : `exp${Date.now()}`;
+    const expense = { ...e, id };
+    setExpenses(prev => [...prev, expense]);
+    void persistExpense(expense);
+    void syncAll().catch(() => {});
   }, []);
 
   // Analytics
