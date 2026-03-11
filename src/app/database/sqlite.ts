@@ -79,6 +79,19 @@ const schemaStatements = [
     is_dirty INTEGER DEFAULT 0
   );`,
   `CREATE INDEX IF NOT EXISTS idx_products_scope ON products(account_id, store_id);`,
+  `CREATE TABLE IF NOT EXISTS product_barcodes (
+    id INTEGER PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    store_id TEXT NOT NULL,
+    product_id INTEGER NOT NULL,
+    barcode TEXT NOT NULL,
+    updated_at INTEGER DEFAULT (strftime('%s','now') * 1000),
+    is_dirty INTEGER DEFAULT 0,
+    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_product_barcodes_scope ON product_barcodes(account_id, store_id);`,
+  `CREATE INDEX IF NOT EXISTS idx_product_barcodes_product ON product_barcodes(product_id);`,
+  `CREATE INDEX IF NOT EXISTS idx_product_barcodes_barcode ON product_barcodes(barcode);`,
   `CREATE TABLE IF NOT EXISTS sales (
     id INTEGER PRIMARY KEY,
     account_id TEXT NOT NULL,

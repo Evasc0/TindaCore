@@ -86,6 +86,21 @@ create table if not exists products (
 create index if not exists products_scope_idx on products (account_id, store_id);
 create index if not exists products_updated_at_idx on products (updated_at);
 
+-- Product barcodes (multiple optional barcodes per product)
+create table if not exists product_barcodes (
+  id text primary key,
+  account_id text not null references accounts(id) on delete cascade,
+  store_id text not null references stores(id) on delete cascade,
+  product_id text not null references products(id) on delete cascade,
+  barcode text not null,
+  updated_at bigint default floor(extract(epoch from now()) * 1000),
+  is_dirty boolean default false,
+  deleted boolean default false
+);
+create index if not exists product_barcodes_scope_idx on product_barcodes (account_id, store_id);
+create index if not exists product_barcodes_product_idx on product_barcodes (product_id);
+create index if not exists product_barcodes_barcode_idx on product_barcodes (barcode);
+
 -- Sales
 create table if not exists sales (
   id text primary key,
@@ -213,6 +228,7 @@ alter table stores disable row level security;
 alter table store_settings disable row level security;
 alter table sessions disable row level security;
 alter table products disable row level security;
+alter table product_barcodes disable row level security;
 alter table sales disable row level security;
 alter table sale_items disable row level security;
 alter table customers disable row level security;

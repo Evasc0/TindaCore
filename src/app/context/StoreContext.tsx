@@ -64,7 +64,7 @@ import {
 } from "../marketplace/marketplaceService";
 import { ChatMessage, sendMessage as sendChatMessage, getConversation, getAllMessages } from "../marketplace/chatService";
 
-export type Unit = "piece" | "pack" | "box" | "kg" | "grams" | "ml" | "liters";
+export type Unit = "piece" | "pack" | "box" | "cavan" | "kg" | "grams" | "ml" | "liters";
 type BaseUnit = "piece" | "grams" | "ml";
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
@@ -78,6 +78,7 @@ export interface Product {
   baseUnit: BaseUnit; // canonical unit for stock tracking
   conversion?: number; // number of base units per selling unit
   barcode?: string;
+  barcodes?: string[];
   category: string;
   isQuickItem: boolean;
   emoji: string;
@@ -750,6 +751,11 @@ const fromBaseUnits = (product: Product, baseQty: number) => {
   return baseQty / factor;
 };
 
+const normalizeBarcodes = (barcodes?: string[], barcode?: string) => {
+  const combined = [...(barcodes || []), ...(barcode ? [barcode] : [])];
+  return Array.from(new Set(combined.map(code => code.trim()).filter(Boolean)));
+};
+
 const formatStockDisplay = (product: Product) => {
   const sellingQty = fromBaseUnits(product, product.stock);
   if (product.unit === "kg" || product.unit === "liters") {
@@ -805,6 +811,16 @@ interface StoreContextType {
   setOperatingUser: (name: string) => void;
   // Products
   addProduct: (p: Omit<Product, "id">) => void;
+  importStarterProducts: (items: Array<{
+    name: string;
+    category: string;
+    price: number;
+    cost: number;
+    stock: number;
+    unit: Unit;
+    conversion?: number;
+    barcodes?: string[];
+  }>) => Promise<{ imported: number; failed: number }>;
   updateProduct: (id: string, p: Partial<Product>) => void;
   deleteProduct: (id: string) => void;
   addStock: (id: string, qty: number, unit?: Unit) => void;
@@ -1268,6 +1284,70 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // Products
+  const importStarterProducts = useCallback(async (items: Array<{
+    name: string;
+    category: string;
+    price: number;
+    cost: number;
+    stock: number;
+    unit: Unit;
+    conversion?: number;
+    barcodes?: string[];
+  }>) => {
+    if (!items.length) {
+      return { imported: 0, failed: 0 };
+    }
+
+    const imported: Product[] = [];
+    for (const item of items) {
+      const unit = item.unit || "piece";
+      const conversion =
+        unit === "pack" || unit === "box"
+          ? Math.max(1, Number(item.conversion || 1))
+          : 1;
+      const baseUnit = getBaseUnit(unit);
+      const stockBase =
+        unit === "pack" || unit === "box"
+          ? item.stock * conversion
+          : unit === "kg" || unit === "liters"
+          ? item.stock * 1000
+          : item.stock;
+      const barcodes = normalizeBarcodes(item.barcodes);
+
+      const product: Product = {
+        id: newId(),
+        name: item.name,
+        price: item.price,
+        cost: item.cost,
+        stock: stockBase,
+        unit,
+        baseUnit,
+        conversion,
+        barcode: barcodes[0] || "",
+        barcodes,
+        category: item.category || "General",
+        isQuickItem: false,
+        emoji: "📦",
+      };
+
+      try {
+        await persistProduct(product);
+        imported.push(product);
+      } catch (err) {
+        console.error("Starter import failed", item.name, err);
+      }
+    }
+
+    if (imported.length) {
+      setProducts(prev => [...prev, ...imported].sort((a, b) => a.name.localeCompare(b.name)));
+      void syncAll().catch(() => {});
+    }
+
+    return {
+      imported: imported.length,
+      failed: items.length - imported.length,
+    };
+  }, []);
   const addProduct = useCallback((p: Omit<Product, "id">) => {
     const unit = p.unit || "piece";
     const conversion = p.conversion || (unit === "pack" || unit === "box" ? 1 : 1);
@@ -1277,8 +1357,18 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       : unit === "kg" || unit === "liters"
       ? (p.stock || 0) * 1000
       : p.stock || 0;
+    const barcodes = normalizeBarcodes(p.barcodes, p.barcode);
     const id = newId();
-    const product: Product = { ...p, id, unit, baseUnit, conversion, stock: stockBase };
+    const product: Product = {
+      ...p,
+      id,
+      unit,
+      baseUnit,
+      conversion,
+      stock: stockBase,
+      barcode: barcodes[0] || "",
+      barcodes,
+    };
     setProducts(prev => [...prev, product]);
     void persistProduct(product);
     void syncAll().catch(() => {});
@@ -1299,7 +1389,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         : unit === "kg" || unit === "liters"
         ? stockProvided * 1000
         : stockProvided;
-      updated = { ...x, ...p, unit, baseUnit, conversion, stock: stockBase };
+      const hasBarcodeUpdates = p.barcodes !== undefined || p.barcode !== undefined;
+      const nextBarcodes = hasBarcodeUpdates
+        ? normalizeBarcodes(p.barcodes, p.barcode)
+        : normalizeBarcodes(x.barcodes, x.barcode);
+      updated = {
+        ...x,
+        ...p,
+        unit,
+        baseUnit,
+        conversion,
+        stock: stockBase,
+        barcode: hasBarcodeUpdates ? nextBarcodes[0] || "" : x.barcode || "",
+        barcodes: nextBarcodes,
+      };
       return updated;
     }));
     if (updated) {
@@ -1344,7 +1447,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     const q = query.toLowerCase();
     return products.filter(p =>
       p.name.toLowerCase().includes(q) ||
-      (p.barcode || "").includes(query)
+      (p.barcode || "").includes(query) ||
+      (p.barcodes || []).some(code => code.includes(query))
     );
   }, [products]);
 
@@ -1728,7 +1832,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       createAccount, login, logout, verifyManagementPin, createManagementPin,
       isManagementMode, operatingUser,
       enterManagementMode, exitManagementMode, completeOnboarding, setOperatingUser,
-      addProduct, updateProduct, deleteProduct, addStock, searchProducts,
+      addProduct, importStarterProducts, updateProduct, deleteProduct, addStock, searchProducts,
       addToCart, removeFromCart, updateCartQty, clearCart, addPabiliToCart,
       completeSale, addUtangSale,
       addCustomer, recordPayment, getCustomerBalance,

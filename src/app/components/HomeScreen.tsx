@@ -52,7 +52,8 @@ export function HomeScreen() {
   const searchResults = searchQuery.trim()
     ? products.filter(p =>
         p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        p.barcode?.includes(searchQuery)
+        p.barcode?.includes(searchQuery) ||
+        (p.barcodes || []).some(code => code.includes(searchQuery))
       ).slice(0, 8)
     : [];
 

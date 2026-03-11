@@ -7,6 +7,7 @@ import { HomeScreen } from "./components/HomeScreen";
 import { POSScreen } from "./components/POSScreen";
 import { InventoryScreen } from "./components/InventoryScreen";
 import { AddProductScreen } from "./components/AddProductScreen";
+import { StarterProductsScreen } from "./components/StarterProductsScreen";
 import { UtangScreen } from "./components/UtangScreen";
 import { CustomerUtangScreen } from "./components/CustomerUtangScreen";
 import { AnalyticsScreen } from "./components/AnalyticsScreen";
@@ -82,6 +83,7 @@ export const router = createBrowserRouter([
                   { path: "dashboard", Component: ManagementDashboard },
                   { path: "inventory", Component: InventoryScreen },
                   { path: "inventory/add", Component: AddProductScreen },
+                  { path: "inventory/starter-products", Component: StarterProductsScreen },
                   { path: "inventory/edit/:id", Component: AddProductScreen },
                   { path: "restock", Component: SmartRestockScreen },
                   { path: "analytics", Component: AnalyticsScreen },

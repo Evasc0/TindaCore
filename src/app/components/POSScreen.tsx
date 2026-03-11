@@ -23,13 +23,19 @@ export function POSScreen() {
   const [searchTerm, setSearchTerm] = useState("");
   const barcodeRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const matchesBarcode = (product: { barcode?: string; barcodes?: string[] }, code: string) => {
+    if (!code) return false;
+    if ((product.barcode || "") === code) return true;
+    return (product.barcodes || []).some(value => value === code);
+  };
 
   const quickItems = products.filter(p => p.isQuickItem);
   const change = parseFloat(paymentInput || "0") - cartTotal;
   const searchResults = searchTerm.trim()
     ? products.filter(p =>
         p.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-        (p.barcode || "").includes(searchTerm)
+        (p.barcode || "").includes(searchTerm) ||
+        (p.barcodes || []).some(code => code.includes(searchTerm))
       ).slice(0, 8)
     : [];
   const displayStock = (p: any) => {
@@ -51,7 +57,8 @@ export function POSScreen() {
   const subCard = isDark ? "#374151" : "#f9fafb";
 
   const handleBarcodeSearch = () => {
-    const found = products.find(p => p.barcode === barcodeInput && barcodeInput !== "");
+    const code = barcodeInput.trim();
+    const found = products.find(p => matchesBarcode(p, code));
     if (found) {
       addToCart(found.id);
       setBarcodeInput("");
@@ -62,7 +69,7 @@ export function POSScreen() {
 
   const handleScanResult = (code: string) => {
     setBarcodeInput(code);
-    const found = products.find(p => p.barcode === code);
+    const found = products.find(p => matchesBarcode(p, code));
     if (found) {
       addToCart(found.id);
       setScanFlash(true);

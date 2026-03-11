@@ -63,13 +63,21 @@ export function InventoryScreen() {
             <h2 className="text-white font-bold" style={{ fontSize: "20px" }}>{t.inventory}</h2>
             <p className="text-purple-300 text-xs mt-0.5">{totalProducts} {t.products.toLowerCase()}</p>
           </div>
-          <button
-            onClick={() => navigate("/management/inventory/add")}
-            className="flex items-center gap-1.5 bg-white text-purple-700 px-3 py-2 rounded-xl font-semibold text-sm shadow-sm active:scale-95 transition-transform"
-          >
-            <Plus size={16} />
-            {t.add}
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => navigate("/management/inventory/starter-products")}
+              className="flex items-center gap-1.5 bg-white text-blue-700 px-3 py-2 rounded-xl font-semibold text-sm shadow-sm active:scale-95 transition-transform"
+            >
+              Starter
+            </button>
+            <button
+              onClick={() => navigate("/management/inventory/add")}
+              className="flex items-center gap-1.5 bg-white text-purple-700 px-3 py-2 rounded-xl font-semibold text-sm shadow-sm active:scale-95 transition-transform"
+            >
+              <Plus size={16} />
+              {t.add}
+            </button>
+          </div>
         </div>
 
         <div className="flex gap-2">
@@ -170,7 +178,7 @@ export function InventoryScreen() {
                   </div>
                   <p className="text-xs mt-0.5" style={{ color: textMuted }}>
                     {product.category}
-                    {product.barcode && " • 📊"}
+                    {(product.barcode || (product.barcodes || []).length > 0) && " • 📊"}
                   </p>
                 </div>
                 <div className="flex flex-col items-end gap-1.5 flex-shrink-0">

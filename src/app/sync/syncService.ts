@@ -14,6 +14,7 @@ const defaultTables: Table[] = [
   "stores",
   "store_settings",
   "products",
+  "product_barcodes",
   "customers",
   "sales",
   "sale_items",
@@ -90,7 +91,7 @@ async function syncTables(tables: Table[]) {
   return { ok: true };
 }
 
-export const syncProducts = () => syncTables(["products"]);
+export const syncProducts = () => syncTables(["products", "product_barcodes"]);
 export const syncSales = () => syncTables(["sales", "sale_items"]);
 export const syncCustomers = () => syncTables(["customers"]);
 export const syncUtang = () => syncTables(["utang_records", "utang_payments"]);

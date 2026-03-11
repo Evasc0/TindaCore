@@ -22,6 +22,7 @@ export type Table =
   | "stores"
   | "store_settings"
   | "products"
+  | "product_barcodes"
   | "sales"
   | "sale_items"
   | "customers"
@@ -64,20 +65,29 @@ const unitFactor = (unit?: Unit, conversion?: number) => {
   return 1;
 };
 
-const mapProduct = (row: any): Product => ({
-  id: String(row.id),
-  name: row.name,
-  barcode: row.barcode || "",
-  price: Number(row.price),
-  cost: Number(row.cost ?? 0),
-  stock: Number(row.stock ?? 0),
-  unit: (row.unit || "piece") as Unit,
-  baseUnit: (row.base_unit || "piece") as Product["baseUnit"],
-  conversion: Number(row.conversion ?? 1),
-  category: row.category || "General",
-  isQuickItem: !!row.is_quick_item,
-  emoji: row.emoji || "🛒",
-});
+const normalizeBarcodeList = (barcodes?: string[], barcode?: string) => {
+  const combined = [...(barcodes || []), ...(barcode ? [barcode] : [])];
+  return Array.from(new Set(combined.map(code => code.trim()).filter(Boolean)));
+};
+
+const mapProduct = (row: any, barcodes: string[] = []): Product => {
+  const normalized = normalizeBarcodeList(barcodes, row.barcode || "");
+  return {
+    id: String(row.id),
+    name: row.name,
+    barcode: normalized[0] || "",
+    barcodes: normalized,
+    price: Number(row.price),
+    cost: Number(row.cost ?? 0),
+    stock: Number(row.stock ?? 0),
+    unit: (row.unit || "piece") as Unit,
+    baseUnit: (row.base_unit || "piece") as Product["baseUnit"],
+    conversion: Number(row.conversion ?? 1),
+    category: row.category || "General",
+    isQuickItem: !!row.is_quick_item,
+    emoji: row.emoji || "📦",
+  };
+};
 
 async function getDb() {
   await initDb();
@@ -194,7 +204,17 @@ export async function getProducts(): Promise<Product[]> {
     "SELECT * FROM products WHERE account_id = :account_id AND store_id = :store_id ORDER BY name ASC",
     scopeParams(scope)
   );
-  return rows.map(mapProduct);
+  const barcodeRows = await queryAll<any>(
+    "SELECT product_id, barcode FROM product_barcodes WHERE account_id = :account_id AND store_id = :store_id",
+    scopeParams(scope)
+  );
+  const barcodesByProduct = barcodeRows.reduce<Record<string, string[]>>((acc, row) => {
+    const key = String(row.product_id);
+    if (!acc[key]) acc[key] = [];
+    acc[key].push(String(row.barcode || ""));
+    return acc;
+  }, {});
+  return rows.map(row => mapProduct(row, barcodesByProduct[String(row.id)] || []));
 }
 
 export async function createProduct(input: Omit<Product, "id"> & { id?: string }): Promise<Product> {
@@ -202,36 +222,67 @@ export async function createProduct(input: Omit<Product, "id"> & { id?: string }
   const scope = requireScope();
   const id = toNumericId(input.id);
   const ts = now();
-  await run(
-    `INSERT INTO products (
-      id, account_id, store_id, name, barcode, price, cost, stock, unit, base_unit, conversion, category, is_quick_item, emoji, updated_at, is_dirty
-    ) VALUES (
-      :id, :account_id, :store_id, :name, :barcode, :price, :cost, :stock, :unit, :base_unit, :conversion, :category, :is_quick_item, :emoji, :ts, 1
-    )`,
-    {
-      ":id": id,
-      ...scopeParams(scope),
-      ":name": input.name,
-      ":barcode": input.barcode || "",
-      ":price": input.price,
-      ":cost": input.cost ?? 0,
-      ":stock": input.stock ?? 0,
-      ":unit": input.unit || "piece",
-      ":base_unit": input.baseUnit || "piece",
-      ":conversion": input.conversion ?? 1,
-      ":category": input.category || "General",
-      ":is_quick_item": input.isQuickItem ? 1 : 0,
-      ":emoji": input.emoji || "🛒",
-      ":ts": ts,
-    }
-  );
-  return { ...input, id: String(id) };
+  const barcodes = normalizeBarcodeList(input.barcodes, input.barcode);
+
+  await runTransaction(db => {
+    db.run(
+      `INSERT INTO products (
+        id, account_id, store_id, name, barcode, price, cost, stock, unit, base_unit, conversion, category, is_quick_item, emoji, updated_at, is_dirty
+      ) VALUES (
+        :id, :account_id, :store_id, :name, :barcode, :price, :cost, :stock, :unit, :base_unit, :conversion, :category, :is_quick_item, :emoji, :ts, 1
+      )`,
+      {
+        ":id": id,
+        ...scopeParams(scope),
+        ":name": input.name,
+        ":barcode": barcodes[0] || "",
+        ":price": input.price,
+        ":cost": input.cost ?? 0,
+        ":stock": input.stock ?? 0,
+        ":unit": input.unit || "piece",
+        ":base_unit": input.baseUnit || "piece",
+        ":conversion": input.conversion ?? 1,
+        ":category": input.category || "General",
+        ":is_quick_item": input.isQuickItem ? 1 : 0,
+        ":emoji": input.emoji || "📦",
+        ":ts": ts,
+      }
+    );
+
+    barcodes.forEach(code => {
+      db.run(
+        `INSERT INTO product_barcodes (
+          id, account_id, store_id, product_id, barcode, updated_at, is_dirty
+        ) VALUES (
+          :id, :account_id, :store_id, :product_id, :barcode, :ts, 1
+        )`,
+        {
+          ":id": generateId(),
+          ...scopeParams(scope),
+          ":product_id": id,
+          ":barcode": code,
+          ":ts": ts,
+        }
+      );
+    });
+  });
+
+  return {
+    ...input,
+    id: String(id),
+    barcode: barcodes[0] || "",
+    barcodes,
+  };
 }
 
 export async function updateProduct(input: Partial<Product> & { id: string }) {
   await getDb();
   const scope = requireScope();
   const fields: string[] = [];
+  const hasBarcodeUpdate = input.barcodes !== undefined || input.barcode !== undefined;
+  const normalizedBarcodes = hasBarcodeUpdate
+    ? normalizeBarcodeList(input.barcodes, input.barcode)
+    : [];
   const params: Record<string, any> = {
     ":id": toNumericId(input.id),
     ":ts": now(),
@@ -251,18 +302,55 @@ export async function updateProduct(input: Partial<Product> & { id: string }) {
     emoji: "emoji",
   };
   Object.entries(input).forEach(([key, value]) => {
+    if (key === "barcodes") return;
     const column = map[key];
     if (!column || value === undefined) return;
     fields.push(`${column} = :${column}`);
     params[`:${column}`] = key === "isQuickItem" ? (value ? 1 : 0) : value;
   });
-  if (!fields.length) return;
-  await run(
-    `UPDATE products
-     SET ${fields.join(", ")}, updated_at = :ts, is_dirty = 1
-     WHERE id = :id AND account_id = :account_id AND store_id = :store_id`,
-    params
-  );
+  if (hasBarcodeUpdate) {
+    if (!fields.includes("barcode = :barcode")) {
+      fields.push("barcode = :barcode");
+    }
+    params[":barcode"] = normalizedBarcodes[0] || "";
+  }
+  if (!fields.length && !hasBarcodeUpdate) return;
+
+  await runTransaction(db => {
+    if (fields.length) {
+      db.run(
+        `UPDATE products
+         SET ${fields.join(", ")}, updated_at = :ts, is_dirty = 1
+         WHERE id = :id AND account_id = :account_id AND store_id = :store_id`,
+        params
+      );
+    }
+
+    if (hasBarcodeUpdate) {
+      db.run(
+        `DELETE FROM product_barcodes
+         WHERE product_id = :id AND account_id = :account_id AND store_id = :store_id`,
+        params
+      );
+
+      normalizedBarcodes.forEach(code => {
+        db.run(
+          `INSERT INTO product_barcodes (
+            id, account_id, store_id, product_id, barcode, updated_at, is_dirty
+          ) VALUES (
+            :barcode_id, :account_id, :store_id, :product_id, :barcode, :ts, 1
+          )`,
+          {
+            ...scopeParams(scope),
+            ":barcode_id": generateId(),
+            ":product_id": toNumericId(input.id),
+            ":barcode": code,
+            ":ts": params[":ts"],
+          }
+        );
+      });
+    }
+  });
 }
 
 export async function deleteProduct(id: string) {
@@ -847,3 +935,4 @@ export async function latestUpdate(table: Table) {
 // Legacy aliases kept for backward compatibility with existing callers
 export const updateProductRecord = updateProduct;
 export const deleteProductRecord = deleteProduct;
+
