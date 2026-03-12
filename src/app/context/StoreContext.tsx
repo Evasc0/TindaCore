@@ -10,6 +10,8 @@ import {
   createSale as persistSale,
   getSales as loadSales,
   createCustomer as persistCustomer,
+  updateCustomer as persistCustomerUpdate,
+  consumeCustomerAdvance as persistCustomerAdvanceUse,
   addUtangRecord as persistUtangRecord,
   recordPayment as persistPayment,
   createPabiliOrder as persistPabiliOrder,
@@ -99,15 +101,45 @@ export interface UtangRecord {
   items: { productId?: string; name: string; qty: number; unit: Unit; price: number; subtotal: number }[];
   amount: number;
   balance: number;
+  status?: "unpaid" | "partial" | "paid";
   payments: { id: string; amount: number; date: string }[];
+}
+
+export interface CustomerPaymentHistoryEntry {
+  id: string;
+  date: string;
+  amount: number;
+  appliedAmount: number;
+  advanceAmount: number;
+  entryType?: "payment" | "advance_deduction";
+  referenceSaleId?: string;
+  note?: string;
 }
 
 export interface Customer {
   id: string;
   name: string;
   phone?: string;
+  note?: string;
+  creditLimit?: number | null;
+  advanceBalance?: number;
+  paymentHistory?: CustomerPaymentHistoryEntry[];
   transactions: UtangRecord[];
 }
+
+export interface CustomerCreditStatus {
+  currentBalance: number;
+  creditLimit: number | null;
+  availableCredit: number | null;
+}
+
+export type AddUtangSaleResult =
+  | { ok: true }
+  | {
+      ok: false;
+      code: "utang_disabled" | "cart_empty" | "customer_not_found" | "credit_limit_exceeded";
+      credit?: CustomerCreditStatus & { newBalance: number };
+    };
 
 export interface Sale {
   id: string;
@@ -258,9 +290,13 @@ export const translations = {
     short: "Short!",
     completeSale: "Complete Sale",
     addUtangBtn: "Utang",
+    partialPaymentBtn: "Partial Payment",
     paidBadge: "Paid — ₱",
     selectCustomer: "Select Customer",
     saveUtang: "Save Utang",
+    savePartialPayment: "Save Partial Payment",
+    amountPaidLabel: "Amount Paid",
+    remainingBalance: "Remaining Balance",
     noPhone: "No phone number",
     currentUtang: "current utang",
     addNewCustomer: "Add new customer",
@@ -313,6 +349,8 @@ export const translations = {
     customerName: "Name",
     customerNamePlaceholder: "e.g. Aling Nena",
     phoneNumber: "Phone (optional)",
+    customerNote: "Note (optional)",
+    customerNotePlaceholder: "Optional note about this customer",
     phonePlaceholder: "09xxxxxxxxx",
     saveCustomer: "Save Customer",
     customerAdded: "Customer added!",
@@ -531,9 +569,13 @@ export const translations = {
     short: "Kulang!",
     completeSale: "I-complete ang Benta",
     addUtangBtn: "Utang",
+    partialPaymentBtn: "Bahagyang Bayad",
     paidBadge: "Bayad Na — ₱",
     selectCustomer: "Piliin ang Customer",
     saveUtang: "I-save ang Utang",
+    savePartialPayment: "I-save ang Bahagyang Bayad",
+    amountPaidLabel: "Halagang Binayad",
+    remainingBalance: "Natitirang Balanse",
     noPhone: "Walang numero",
     currentUtang: "kasalukuyang utang",
     addNewCustomer: "Dagdag bagong customer",
@@ -586,6 +628,8 @@ export const translations = {
     customerName: "Pangalan",
     customerNamePlaceholder: "hal. Aling Nena",
     phoneNumber: "Numero (opsyonal)",
+    customerNote: "Note (opsyonal)",
+    customerNotePlaceholder: "Opsyonal na tala para sa customer",
     phonePlaceholder: "09xxxxxxxxx",
     saveCustomer: "I-save ang Customer",
     customerAdded: "Na-add ang customer!",
@@ -756,6 +800,12 @@ const normalizeBarcodes = (barcodes?: string[], barcode?: string) => {
   return Array.from(new Set(combined.map(code => code.trim()).filter(Boolean)));
 };
 
+const getUtangStatus = (amount: number, balance: number): UtangRecord["status"] => {
+  if (balance <= 0) return "paid";
+  if (balance < amount) return "partial";
+  return "unpaid";
+};
+
 const formatStockDisplay = (product: Product) => {
   const sellingQty = fromBaseUnits(product, product.stock);
   if (product.unit === "kg" || product.unit === "liters") {
@@ -796,6 +846,7 @@ interface StoreContextType {
   login: (emailOrMobile: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   verifyManagementPin: (pin: string) => Promise<boolean>;
+  verifyManagementPinForAction: (pin: string) => Promise<boolean>;
   createManagementPin: (pin: string) => Promise<boolean>;
   // Mode
   isManagementMode: boolean;
@@ -833,11 +884,13 @@ interface StoreContextType {
   addPabiliToCart: (order: PabiliOrder) => void;
   // Sales
   completeSale: (amountPaid: number, method?: Sale["paymentType"]) => void;
-  addUtangSale: (customerId: string) => void;
+  addUtangSale: (customerId: string, amountPaid?: number, forceOverride?: boolean, applyAdvanceFirst?: boolean) => AddUtangSaleResult;
   // Customers
-  addCustomer: (name: string, phone?: string) => void;
-  recordPayment: (customerId: string, txId: string, amount: number) => void;
+  addCustomer: (name: string, phone?: string, note?: string, creditLimit?: number | null) => string;
+  updateCustomerProfile: (customerId: string, changes: { name: string; phone?: string; creditLimit?: number | null }) => void;
+  recordPayment: (customerId: string, amount: number) => void;
   getCustomerBalance: (customerId: string) => number;
+  getCustomerCreditStatus: (customerId: string) => CustomerCreditStatus;
   // Pabili
   addPabiliOrder: (order: Omit<PabiliOrder, "id">) => void;
   updatePabiliStatus: (id: string, status: PabiliOrder["status"]) => void;
@@ -931,6 +984,8 @@ const seedCustomers = [
 
 const initialCustomers: Customer[] = seedCustomers.map(c => ({
   ...c,
+  advanceBalance: 0,
+  paymentHistory: [],
   transactions: c.transactions.map(tx => ({
     id: tx.id,
     date: tx.date,
@@ -942,6 +997,7 @@ const initialCustomers: Customer[] = seedCustomers.map(c => ({
     })),
     amount: tx.total,
     balance: tx.paid ? 0 : tx.total,
+    status: tx.paid ? "paid" : "unpaid",
     payments: tx.paid ? [{ id: `pay-${tx.id}`, amount: tx.total, date: tx.date }] : [],
   })),
 }));
@@ -1234,6 +1290,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     return ok;
   }, [currentStore]);
 
+  const verifyManagementPinForAction = useCallback(async (pin: string) => {
+    if (!currentStore) return false;
+    return verifyManagementPinForStore(currentStore.id, pin);
+  }, [currentStore]);
+
   const createManagementPin = useCallback(async (pin: string) => {
     if (!currentStore) return false;
     await setManagementPin(currentStore.id, pin);
@@ -1503,6 +1564,21 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     });
   }, [products]);
 
+  const getCustomerCreditStatus = useCallback((customerId: string): CustomerCreditStatus => {
+    const customer = customers.find(x => x.id === customerId);
+    const currentBalance = customer?.transactions.reduce((sum, tx) => sum + tx.balance, 0) ?? 0;
+    const rawLimit = customer?.creditLimit;
+    const normalizedLimit =
+      rawLimit === null || rawLimit === undefined || Number.isNaN(Number(rawLimit))
+        ? null
+        : Math.max(0, Number(rawLimit));
+    return {
+      currentBalance,
+      creditLimit: normalizedLimit,
+      availableCredit: normalizedLimit === null ? null : Math.max(0, normalizedLimit - currentBalance),
+    };
+  }, [customers]);
+
   // Sales
   const completeSale = useCallback((amountPaid: number, method = "cash") => {
     if (cart.length === 0) return;
@@ -1548,13 +1624,51 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     void syncAll().catch(() => {});
   }, [cart, cartTotal, operatingUser, products]);
 
-  const addUtangSale = useCallback((customerId: string) => {
-    if (cart.length === 0) return;
+  const addUtangSale = useCallback((
+    customerId: string,
+    amountPaid = 0,
+    forceOverride = false,
+    applyAdvanceFirst = false
+  ): AddUtangSaleResult => {
+    if (!settings.enableUtang) return { ok: false, code: "utang_disabled" };
+    if (cart.length === 0) return { ok: false, code: "cart_empty" };
+    const customer = customers.find(c => c.id === customerId);
+    if (!customer) return { ok: false, code: "customer_not_found" };
     const now = new Date();
     const nowStr = now.toISOString();
     const saleId = newId();
     const utangId = newId();
-    const items = cart.map(i => ({
+    const safeAmountPaid = Math.max(0, Math.min(amountPaid, cartTotal));
+    const baseUtangAmount = Math.max(0, cartTotal - safeAmountPaid);
+    const customerAdvance = Math.max(0, Number(customer.advanceBalance || 0));
+    const advanceUsed = applyAdvanceFirst ? Math.min(customerAdvance, baseUtangAmount) : 0;
+    const remainingBalance = Math.max(0, baseUtangAmount - advanceUsed);
+    const shouldCreateUtang = remainingBalance > 0;
+    const persistedAmountPaid = Math.min(cartTotal, safeAmountPaid + advanceUsed);
+    const credit = getCustomerCreditStatus(customerId);
+    const newBalance = credit.currentBalance + remainingBalance;
+    if (
+      credit.creditLimit !== null &&
+      remainingBalance > 0 &&
+      newBalance > credit.creditLimit &&
+      !forceOverride
+    ) {
+      return {
+        ok: false,
+        code: "credit_limit_exceeded",
+        credit: { ...credit, newBalance },
+      };
+    }
+    const saleItems = cart.map(i => ({
+      productId: i.productId,
+      name: i.productName,
+      qty: i.quantity,
+      unit: i.unit,
+      price: i.price,
+      cost: products.find(p => p.id === i.productId)?.cost ?? i.price * 0.65,
+      subtotal: i.subtotal,
+    }));
+    const utangItems = cart.map(i => ({
       productId: i.productId,
       name: i.productName,
       qty: i.quantity,
@@ -1562,93 +1676,214 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       price: i.price,
       subtotal: i.subtotal,
     }));
-    const newTx: UtangRecord = {
-      id: utangId,
-      date: nowStr.split("T")[0],
-      customerId,
-      items,
-      amount: cartTotal,
-      balance: cartTotal,
-      payments: [],
-    };
+    const newTx: UtangRecord | null = shouldCreateUtang
+      ? {
+          id: utangId,
+          date: nowStr.split("T")[0],
+          items: utangItems,
+          amount: cartTotal,
+          balance: remainingBalance,
+          status: getUtangStatus(cartTotal, remainingBalance),
+          payments: [],
+        }
+      : null;
     setSales(prev => [{
       id: saleId,
       timestamp: nowStr,
       date: nowStr,
-      items: cart.map(i => ({
-        productId: i.productId,
-        name: i.productName,
-        qty: i.quantity,
-        unit: i.unit,
-        price: i.price,
-        cost: products.find(p => p.id === i.productId)?.cost ?? i.price * 0.65,
-        subtotal: i.subtotal,
-      })),
+      items: saleItems,
       total: cartTotal,
-      paymentType: "utang",
-      isUtang: true,
+      paymentType: shouldCreateUtang ? "utang" : "cash",
+      isUtang: shouldCreateUtang,
       customerId,
-      customerName: customers.find(c => c.id === customerId)?.name,
+      customerName: customer.name,
       helperName: operatingUser,
     }, ...prev]);
-    setCustomers(prev => prev.map(c => c.id === customerId ? { ...c, transactions: [newTx, ...c.transactions] } : c));
+    setCustomers(prev => prev.map(c => {
+      if (c.id !== customerId) return c;
+      const nextAdvance = Math.max(0, Number(c.advanceBalance || 0) - advanceUsed);
+      const nextHistory = advanceUsed > 0
+        ? [{
+            id: `adv-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+            date: nowStr,
+            amount: advanceUsed,
+            appliedAmount: 0,
+            advanceAmount: -advanceUsed,
+            entryType: "advance_deduction" as const,
+            referenceSaleId: saleId,
+            note: shouldCreateUtang
+              ? "Advance applied before creating utang."
+              : "Advance fully covered checkout.",
+          }, ...(c.paymentHistory || [])]
+        : (c.paymentHistory || []);
+      if (!newTx) {
+        return {
+          ...c,
+          advanceBalance: nextAdvance,
+          paymentHistory: nextHistory,
+        };
+      }
+      return {
+        ...c,
+        advanceBalance: nextAdvance,
+        paymentHistory: nextHistory,
+        transactions: [newTx, ...c.transactions],
+      };
+    }));
     setProducts(prev => prev.map(p => {
       const ci = cart.find(i => i.productId === p.id);
       return ci ? { ...p, stock: Math.max(0, p.stock - toBaseUnits(p, ci.quantity)) } : p;
     }));
     setCart([]);
-    void persistSale({
-      id: saleId,
-      items: items.map(item => {
-        const product = products.find(p => p.id === item.productId);
-        return { ...item, cost: product?.cost ?? item.price * 0.65 };
-      }),
-      total: cartTotal,
-      paymentType: "utang",
-      isUtang: true,
-      customerId,
-      timestamp: now.getTime(),
-    });
-    void persistUtangRecord({
-      id: utangId,
-      customerId,
-      items,
-      amount: cartTotal,
-      balance: cartTotal,
-      date: nowStr.split("T")[0],
-    });
-    void syncAll().catch(() => {});
-  }, [cart, cartTotal, customers, operatingUser, products]);
+    void (async () => {
+      try {
+        await persistSale({
+          id: saleId,
+          items: saleItems,
+          total: cartTotal,
+          paymentType: shouldCreateUtang ? "utang" : "cash",
+          isUtang: shouldCreateUtang,
+          customerId,
+          amountPaid: persistedAmountPaid,
+          changeDue: 0,
+          timestamp: now.getTime(),
+          forceCreditLimitOverride: forceOverride,
+        });
+        if (advanceUsed > 0) {
+          await persistCustomerAdvanceUse(customerId, advanceUsed, nowStr, saleId, shouldCreateUtang);
+        }
+        if (shouldCreateUtang) {
+          await persistUtangRecord({
+            id: utangId,
+            customerId,
+            items: utangItems,
+            amount: cartTotal,
+            balance: remainingBalance,
+            date: nowStr.split("T")[0],
+            forceCreditLimitOverride: forceOverride,
+          });
+        }
+        await syncAll().catch(() => {});
+      } catch {
+        // Keep UI responsive if persistence fails; sync retry will handle eventual consistency.
+      }
+    })();
+    return { ok: true };
+  }, [cart, cartTotal, customers, getCustomerCreditStatus, operatingUser, products, settings.enableUtang]);
 
   // Customers
-  const addCustomer = useCallback((name: string, phone?: string) => {
+  const addCustomer = useCallback((name: string, phone?: string, note?: string, creditLimit: number | null = null) => {
     const id = newId();
-    setCustomers(prev => [...prev, { id, name, phone, transactions: [] }]);
-    void persistCustomer(name, phone, id);
+    const normalizedLimit = creditLimit === null || creditLimit === undefined
+      ? null
+      : Math.max(0, Number(creditLimit));
+    setCustomers(prev => [...prev, {
+      id,
+      name,
+      phone,
+      note,
+      creditLimit: normalizedLimit,
+      advanceBalance: 0,
+      paymentHistory: [],
+      transactions: [],
+    }]);
+    void persistCustomer(name, phone, id, note, normalizedLimit);
+    void syncAll().catch(() => {});
+    return id;
+  }, []);
+  const updateCustomerProfile = useCallback((customerId: string, changes: { name: string; phone?: string; creditLimit?: number | null }) => {
+    const normalizedLimit = changes.creditLimit === null || changes.creditLimit === undefined
+      ? null
+      : Math.max(0, Number(changes.creditLimit));
+    setCustomers(prev => prev.map(customer => {
+      if (customer.id !== customerId) return customer;
+      return {
+        ...customer,
+        name: changes.name,
+        phone: changes.phone,
+        creditLimit: normalizedLimit,
+      };
+    }));
+    void persistCustomerUpdate(customerId, {
+      name: changes.name,
+      phone: changes.phone,
+      creditLimit: normalizedLimit,
+    });
     void syncAll().catch(() => {});
   }, []);
-  const recordPayment = useCallback((customerId: string, txId: string, amount: number) => {
-    if (amount <= 0) return;
-    setCustomers(prev => prev.map(c => c.id === customerId ? {
-      ...c,
-      transactions: c.transactions.map(t => {
-        if (t.id !== txId) return t;
-        const payAmt = Math.min(amount, t.balance);
-        return {
-          ...t,
-          balance: Math.max(0, t.balance - payAmt),
-          payments: [...t.payments, { id: `pay${Date.now()}`, amount: payAmt, date: new Date().toISOString() }],
-        };
-      }),
-    } : c));
-    void persistPayment(txId, amount, new Date().toISOString());
+  const recordPayment = useCallback((customerId: string, amount: number) => {
+    const normalizedAmount = Math.max(0, Number(amount || 0));
+    if (normalizedAmount <= 0) return;
+
+    const customer = customers.find(c => c.id === customerId);
+    if (!customer) return;
+
+    const oldestUnpaid = [...customer.transactions]
+      .filter(tx => tx.balance > 0)
+      .sort((a, b) => {
+        const dateDiff = new Date(a.date).getTime() - new Date(b.date).getTime();
+        if (dateDiff !== 0) return dateDiff;
+        return a.id.localeCompare(b.id);
+      });
+
+    let remaining = normalizedAmount;
+    const allocations: Record<string, number> = {};
+    oldestUnpaid.forEach(tx => {
+      if (remaining <= 0) return;
+      const applied = Math.min(tx.balance, remaining);
+      if (applied <= 0) return;
+      allocations[tx.id] = applied;
+      remaining -= applied;
+    });
+
+    const appliedAmount = normalizedAmount - remaining;
+    const advanceAmount = Math.max(0, remaining);
+    const paymentDate = new Date().toISOString();
+    const paymentHistoryId = `hist-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+
+    setCustomers(prev => prev.map(c => {
+      if (c.id !== customerId) return c;
+      return {
+        ...c,
+        advanceBalance: (c.advanceBalance || 0) + advanceAmount,
+        paymentHistory: [{
+          id: paymentHistoryId,
+          date: paymentDate,
+          amount: normalizedAmount,
+          appliedAmount,
+          advanceAmount,
+          entryType: "payment",
+          note: "Customer payment recorded.",
+        }, ...(c.paymentHistory || [])],
+        transactions: c.transactions.map(tx => {
+          const applied = allocations[tx.id] || 0;
+          if (applied <= 0) {
+            return {
+              ...tx,
+              status: getUtangStatus(tx.amount, tx.balance),
+            };
+          }
+          const newBalance = Math.max(0, tx.balance - applied);
+          return {
+            ...tx,
+            balance: newBalance,
+            status: getUtangStatus(tx.amount, newBalance),
+            payments: [...tx.payments, {
+              id: `pay-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+              amount: applied,
+              date: paymentDate,
+            }],
+          };
+        }),
+      };
+    }));
+
+    void persistPayment(customerId, normalizedAmount, paymentDate);
     void syncAll().catch(() => {});
-  }, []);
-  const getCustomerBalance = useCallback((customerId: string) => {
-    const c = customers.find(x => x.id === customerId);
-    if (!c) return 0;
-    return c.transactions.reduce((s, t) => s + t.balance, 0);
   }, [customers]);
+  const getCustomerBalance = useCallback((customerId: string) => {
+    return getCustomerCreditStatus(customerId).currentBalance;
+  }, [getCustomerCreditStatus]);
 
   // Pabili
   const addPabiliOrder = useCallback((order: Omit<PabiliOrder, "id">) => {
@@ -1829,13 +2064,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     <StoreContext.Provider value={{
       products, cart, customers, sales, pabiliOrders, expenses, restockList, suppliers, restockOrders, chatMessages, settings, t,
       currentAccount, currentStore, session, managementUnlocked, isHydrated,
-      createAccount, login, logout, verifyManagementPin, createManagementPin,
+      createAccount, login, logout, verifyManagementPin, verifyManagementPinForAction, createManagementPin,
       isManagementMode, operatingUser,
       enterManagementMode, exitManagementMode, completeOnboarding, setOperatingUser,
       addProduct, importStarterProducts, updateProduct, deleteProduct, addStock, searchProducts,
       addToCart, removeFromCart, updateCartQty, clearCart, addPabiliToCart,
       completeSale, addUtangSale,
-      addCustomer, recordPayment, getCustomerBalance,
+      addCustomer, updateCustomerProfile, recordPayment, getCustomerBalance, getCustomerCreditStatus,
       addPabiliOrder, updatePabiliStatus,
       updateRestockList, checkRestockItem, placeRestockOrder, updateRestockOrderStatus, getSupplierCatalog,
       sendChat, getConversation: getConversationMessages,

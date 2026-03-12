@@ -29,6 +29,20 @@ export function SettingsScreen() {
     setTimeout(() => setSaved(false), 2000);
   };
 
+  type FeatureToggleKey =
+    | "enableUtang"
+    | "enablePabili"
+    | "enableBarcodeScanner"
+    | "enableReceiptPrinter";
+
+  const toggleFeature = (key: FeatureToggleKey) => {
+    setForm(prev => {
+      const nextValue = !prev[key];
+      updateSettings({ [key]: nextValue } as Partial<StoreSettings>);
+      return { ...prev, [key]: nextValue };
+    });
+  };
+
   const handleLogout = async () => {
     setLoggingOut(true);
     try {
@@ -143,10 +157,10 @@ export function SettingsScreen() {
         {/* Feature Toggles */}
         <Section id="features" icon={Zap} title={settings.language === "fil" ? "Mga Feature" : "Feature Toggles"} color="#7c3aed">
           {[
-            { key: "enableUtang" as const, label: "Utang / Credit Tracking", desc: "Allow recording customer credit" },
-            { key: "enablePabili" as const, label: "Pabili Orders", desc: "Enable QR-based order requests" },
-            { key: "enableBarcodeScanner" as const, label: "Barcode Scanner", desc: "Enable barcode scanning in POS" },
-            { key: "enableReceiptPrinter" as const, label: "Receipt Printer", desc: "Bluetooth thermal printer support" },
+            { key: "enableUtang" as FeatureToggleKey, label: "Utang / Credit Tracking", desc: "Allow recording customer credit" },
+            { key: "enablePabili" as FeatureToggleKey, label: "Pabili Orders", desc: "Enable QR-based order requests" },
+            { key: "enableBarcodeScanner" as FeatureToggleKey, label: "Barcode Scanner", desc: "Enable barcode scanning in POS" },
+            { key: "enableReceiptPrinter" as FeatureToggleKey, label: "Receipt Printer", desc: "Bluetooth thermal printer support" },
           ].map(({ key, label, desc }) => (
             <div key={key} className="flex items-center justify-between px-4 py-3.5 border-b last:border-0" style={{ borderColor: cardBorder }}>
               <div>
@@ -154,7 +168,7 @@ export function SettingsScreen() {
                 <p className="text-xs" style={{ color: textMuted }}>{desc}</p>
               </div>
               <button
-                onClick={() => setForm(f => ({ ...f, [key]: !f[key] }))}
+                onClick={() => toggleFeature(key)}
                 className="relative flex-shrink-0 ml-3"
                 style={{ width: "44px", height: "24px", borderRadius: "12px", background: (form as any)[key] ? "#2563eb" : isDark ? "#374151" : "#d1d5db", transition: "background 0.25s" }}
               >

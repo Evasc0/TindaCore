@@ -15,7 +15,7 @@ export function OperatingLayout() {
     { path: "/", icon: Home, label: t.home },
     { path: "/pos", icon: ShoppingCart, label: t.sell },
     { path: "/pabili", icon: Bell, label: t.pabili },
-    { path: "/utang", icon: Users, label: t.utang },
+    ...(settings.enableUtang ? [{ path: "/utang", icon: Users, label: t.utang }] : []),
   ];
 
   const isActive = (path: string) => {

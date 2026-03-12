@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useNavigate, useLocation } from "react-router";
 import { Search, Plus, ChevronRight, X, Check, Users } from "lucide-react";
 import { useStore } from "../context/StoreContext";
@@ -10,12 +10,14 @@ export function UtangScreen() {
   const isDark = settings.theme === "dark";
 
   // Determine base path (management vs operating mode)
-  const basePath = location.pathname.startsWith("/management") ? "/management/utang" : "/utang";
+  const isManagementRoute = location.pathname.startsWith("/management");
+  const basePath = isManagementRoute ? "/management/utang" : "/utang";
 
   const [search, setSearch] = useState("");
   const [showAddModal, setShowAddModal] = useState(false);
   const [newName, setNewName] = useState("");
   const [newPhone, setNewPhone] = useState("");
+  const [newNote, setNewNote] = useState("");
   const [saved, setSaved] = useState(false);
 
   const card = isDark ? "#1f2937" : "#ffffff";
@@ -29,11 +31,27 @@ export function UtangScreen() {
     c.name.toLowerCase().includes(search.toLowerCase()) || (c.phone || "").includes(search)
   );
 
+  useEffect(() => {
+    if (!settings.enableUtang && !isManagementRoute) {
+      navigate("/", { replace: true });
+    }
+  }, [isManagementRoute, navigate, settings.enableUtang]);
+
+  if (!settings.enableUtang && !isManagementRoute) {
+    return null;
+  }
+
   const handleAddCustomer = () => {
     if (!newName.trim()) return;
-    addCustomer(newName.trim(), newPhone.trim());
+    addCustomer(newName.trim(), newPhone.trim(), newNote.trim());
     setSaved(true);
-    setTimeout(() => { setSaved(false); setNewName(""); setNewPhone(""); setShowAddModal(false); }, 1000);
+    setTimeout(() => {
+      setSaved(false);
+      setNewName("");
+      setNewPhone("");
+      setNewNote("");
+      setShowAddModal(false);
+    }, 1000);
   };
 
   const getInitials = (name: string) => name.split(" ").map(w => w[0]).join("").toUpperCase().substring(0, 2);
@@ -111,6 +129,7 @@ export function UtangScreen() {
             .map((customer, idx) => {
               const balance = getCustomerBalance(customer.id);
               const pendingTx = customer.transactions.filter(tx => tx.balance > 0).length;
+              const advanceBalance = Math.max(0, Number(customer.advanceBalance || 0));
               const av = avatarColors[idx % avatarColors.length];
 
               return (
@@ -132,6 +151,16 @@ export function UtangScreen() {
                       {customer.phone || t.noPhone2}
                       {pendingTx > 0 && ` • ${pendingTx} ${t.pending}`}
                     </p>
+                    {advanceBalance > 0 && (
+                      <div
+                        className="inline-flex items-center mt-1 px-2 py-0.5 rounded-full"
+                        style={{ background: isDark ? "#14532d" : "#dcfce7" }}
+                      >
+                        <span className="text-[10px] font-semibold" style={{ color: "#16a34a" }}>
+                          {`Advance: \u20B1${advanceBalance.toFixed(2)}`}
+                        </span>
+                      </div>
+                    )}
                   </div>
                   <div className="flex items-center gap-2 flex-shrink-0">
                     {balance > 0 ? (
@@ -207,6 +236,20 @@ export function UtangScreen() {
                     placeholder={t.phonePlaceholder}
                     className="w-full rounded-xl px-4 py-3 outline-none text-sm border"
                     style={{ background: isDark ? "#374151" : "#f9fafb", color: text, borderColor: cardBorder }}
+                  />
+                </div>
+
+                <div className="mb-6">
+                  <label className="text-xs font-semibold uppercase tracking-wider block mb-2" style={{ color: textMuted }}>
+                    {t.customerNote}
+                  </label>
+                  <textarea
+                    value={newNote}
+                    onChange={e => setNewNote(e.target.value)}
+                    placeholder={t.customerNotePlaceholder}
+                    className="w-full rounded-xl px-4 py-3 outline-none text-sm border resize-none"
+                    style={{ background: isDark ? "#374151" : "#f9fafb", color: text, borderColor: cardBorder }}
+                    rows={3}
                   />
                 </div>
 

@@ -108,7 +108,7 @@ export function ManagementDashboard() {
       badgeColor: "#f97316",
       tier: "premium" as const,
     },
-    {
+    ...(settings.enableUtang ? [{
       icon: Users,
       color: "#d97706",
       iconBg: isDark ? "#451a03" : "#fef3c7",
@@ -120,7 +120,7 @@ export function ManagementDashboard() {
         : null,
       badgeColor: "#d97706",
       tier: null,
-    },
+    }] : []),
     {
       icon: BarChart2,
       color: "#059669",

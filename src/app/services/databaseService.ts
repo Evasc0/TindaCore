@@ -28,6 +28,7 @@ export type Table =
   | "customers"
   | "utang_records"
   | "utang_payments"
+  | "customer_payment_history"
   | "pabili_orders"
   | "expenses";
 
@@ -98,6 +99,61 @@ function requireScope() {
     throw new Error("No active account/store scope.");
   }
   return currentScope;
+}
+
+async function isUtangEnabled(scope: DataScope) {
+  const row = await queryOne<{ utang_enabled: number | null }>(
+    "SELECT utang_enabled FROM store_settings WHERE store_id = :store_id LIMIT 1",
+    { ":store_id": scope.storeId }
+  );
+  if (!row || row.utang_enabled === null || row.utang_enabled === undefined) return true;
+  return Number(row.utang_enabled) === 1;
+}
+
+async function assertUtangEnabled(scope: DataScope) {
+  if (!(await isUtangEnabled(scope))) {
+    throw new Error("Utang feature is disabled for this store.");
+  }
+}
+
+type CustomerCreditSnapshot = {
+  creditLimit: number | null;
+  currentBalance: number;
+};
+
+async function getCustomerCreditSnapshot(scope: DataScope, customerId: DbId): Promise<CustomerCreditSnapshot> {
+  const customerRef = await resolveExistingId("customers", customerId, scope);
+  if (!customerRef.exists) {
+    throw new Error(`Cannot validate credit limit: customer not found (${customerId})`);
+  }
+  const customerRow = await queryOne<{ credit_limit: number | null }>(
+    `SELECT credit_limit FROM customers
+     WHERE id = :id AND account_id = :account_id AND store_id = :store_id
+     LIMIT 1`,
+    { ":id": customerRef.id, ...scopeParams(scope) }
+  );
+  const balanceRow = await queryOne<{ total_balance: number | null }>(
+    `SELECT COALESCE(SUM(balance), 0) as total_balance
+     FROM utang_records
+     WHERE customer_id = :customer_id AND account_id = :account_id AND store_id = :store_id`,
+    { ":customer_id": customerRef.id, ...scopeParams(scope) }
+  );
+  return {
+    creditLimit: customerRow?.credit_limit !== null && customerRow?.credit_limit !== undefined
+      ? Number(customerRow.credit_limit)
+      : null,
+    currentBalance: Number(balanceRow?.total_balance || 0),
+  };
+}
+
+async function assertWithinCustomerCreditLimit(scope: DataScope, customerId: DbId, addedBalance: number) {
+  if (addedBalance <= 0) return;
+  const snapshot = await getCustomerCreditSnapshot(scope, customerId);
+  if (snapshot.creditLimit === null) return;
+  const newBalance = snapshot.currentBalance + addedBalance;
+  if (newBalance > snapshot.creditLimit) {
+    throw new Error("Credit limit exceeded for customer.");
+  }
 }
 
 function scopeParams(scope: DataScope) {
@@ -419,9 +475,18 @@ export async function createSale(input: {
   amountPaid?: number;
   changeDue?: number;
   timestamp?: number;
+  forceCreditLimitOverride?: boolean;
 }) {
   await getDb();
   const scope = requireScope();
+  if (input.isUtang || input.paymentType === "utang") {
+    await assertUtangEnabled(scope);
+    if (input.customerId && !input.forceCreditLimitOverride) {
+      const paid = Math.max(0, Number(input.amountPaid ?? 0));
+      const addedBalance = Math.max(0, Number(input.total) - paid);
+      await assertWithinCustomerCreditLimit(scope, input.customerId, addedBalance);
+    }
+  }
   const saleId = toNumericId(input.id);
   const ts = input.timestamp ?? now();
 
@@ -519,6 +584,12 @@ export async function getCustomers(): Promise<Customer[]> {
     "SELECT * FROM utang_payments WHERE account_id = :account_id AND store_id = :store_id",
     scopeParams(scope)
   );
+  const paymentHistoryRows = await queryAll<any>(
+    `SELECT * FROM customer_payment_history
+     WHERE account_id = :account_id AND store_id = :store_id
+     ORDER BY date DESC, id DESC`,
+    scopeParams(scope)
+  );
 
   const paymentsByUtang = payments.reduce<Record<string, any[]>>((acc, p) => {
     const key = String(p.utang_id);
@@ -528,12 +599,15 @@ export async function getCustomers(): Promise<Customer[]> {
   }, {});
 
   const utangByCustomer = utang.reduce<Record<string, UtangRecord[]>>((acc, r) => {
+    const amount = Number(r.amount);
+    const balance = Number(r.balance);
     const rec: UtangRecord = {
       id: String(r.id),
       date: r.date,
       items: r.items_json ? JSON.parse(r.items_json) : [],
-      amount: Number(r.amount),
-      balance: Number(r.balance),
+      amount,
+      balance,
+      status: balance <= 0 ? "paid" : balance < amount ? "partial" : "unpaid",
       payments: (paymentsByUtang[String(r.id)] || []).map(p => ({
         id: String(p.id),
         amount: Number(p.amount),
@@ -546,30 +620,148 @@ export async function getCustomers(): Promise<Customer[]> {
     return acc;
   }, {});
 
+  const paymentHistoryByCustomer = paymentHistoryRows.reduce<Record<string, NonNullable<Customer["paymentHistory"]>>>((acc, row) => {
+    const customerId = String(row.customer_id);
+    if (!acc[customerId]) acc[customerId] = [];
+    acc[customerId].push({
+      id: String(row.id),
+      date: row.date,
+      amount: Number(row.amount || 0),
+      appliedAmount: Number(row.applied_amount || 0),
+      advanceAmount: Number(row.advance_amount || 0),
+      entryType: row.entry_type === "advance_deduction" ? "advance_deduction" : "payment",
+      referenceSaleId: row.reference_sale_id ? String(row.reference_sale_id) : undefined,
+      note: row.note || undefined,
+    });
+    return acc;
+  }, {});
+
   return customers.map(c => ({
     id: String(c.id),
     name: c.name,
     phone: c.phone || "",
+    note: c.note || "",
+    creditLimit: c.credit_limit !== null && c.credit_limit !== undefined ? Number(c.credit_limit) : null,
+    advanceBalance: Number(c.advance_balance || 0),
+    paymentHistory: paymentHistoryByCustomer[String(c.id)] || [],
     transactions: utangByCustomer[String(c.id)] || [],
   }));
 }
 
-export async function createCustomer(name: string, phone?: string, id?: string) {
+export async function createCustomer(
+  name: string,
+  phone?: string,
+  id?: string,
+  note?: string,
+  creditLimit?: number | null
+) {
   await getDb();
   const scope = requireScope();
   const customerId = toNumericId(id);
   await run(
-    `INSERT INTO customers (id, account_id, store_id, name, phone, updated_at, is_dirty)
-     VALUES (:id, :account_id, :store_id, :name, :phone, :ts, 1)`,
+    `INSERT INTO customers (id, account_id, store_id, name, phone, note, credit_limit, advance_balance, updated_at, is_dirty)
+     VALUES (:id, :account_id, :store_id, :name, :phone, :note, :credit_limit, :advance_balance, :ts, 1)`,
     {
       ":id": customerId,
       ...scopeParams(scope),
       ":name": name,
       ":phone": phone || "",
+      ":note": note || "",
+      ":credit_limit": creditLimit ?? null,
+      ":advance_balance": 0,
       ":ts": now(),
     }
   );
   return String(customerId);
+}
+
+export async function updateCustomer(id: string, updates: {
+  name: string;
+  phone?: string;
+  creditLimit?: number | null;
+}) {
+  await getDb();
+  const scope = requireScope();
+  await run(
+    `UPDATE customers
+     SET name = :name, phone = :phone, credit_limit = :credit_limit, updated_at = :ts, is_dirty = 1
+     WHERE id = :id AND account_id = :account_id AND store_id = :store_id`,
+    {
+      ":id": toNumericId(id),
+      ...scopeParams(scope),
+      ":name": updates.name,
+      ":phone": updates.phone || "",
+      ":credit_limit": updates.creditLimit ?? null,
+      ":ts": now(),
+    }
+  );
+  return id;
+}
+
+export async function consumeCustomerAdvance(
+  customerId: string,
+  amount: number,
+  date: string,
+  referenceSaleId?: string,
+  createdUtang = false
+) {
+  await getDb();
+  const scope = requireScope();
+  const ts = now();
+  const normalizedAmount = Math.max(0, Number(amount || 0));
+  if (normalizedAmount <= 0) return null;
+
+  const customerRef = await resolveExistingId("customers", customerId, scope);
+  if (!customerRef.exists) {
+    throw new Error(`Cannot consume advance balance: customer not found (${customerId})`);
+  }
+  const historyId = generateId();
+
+  await runTransaction(db => {
+    db.run(
+      `UPDATE customers
+       SET advance_balance = CASE
+           WHEN COALESCE(advance_balance, 0) - :amount < 0 THEN 0
+           ELSE COALESCE(advance_balance, 0) - :amount
+         END,
+         updated_at = :ts,
+         is_dirty = 1
+       WHERE id = :id
+         AND account_id = :account_id
+         AND store_id = :store_id`,
+      {
+        ":amount": normalizedAmount,
+        ":ts": ts,
+        ":id": customerRef.id,
+        ...scopeParams(scope),
+      }
+    );
+
+    db.run(
+      `INSERT INTO customer_payment_history (
+        id, account_id, store_id, customer_id, amount, applied_amount, advance_amount, date,
+        entry_type, reference_sale_id, note, updated_at, is_dirty
+      ) VALUES (
+        :id, :account_id, :store_id, :customer_id, :amount, :applied_amount, :advance_amount, :date,
+        :entry_type, :reference_sale_id, :note, :ts, 1
+      )`,
+      {
+        ":id": historyId,
+        ...scopeParams(scope),
+        ":customer_id": customerRef.id,
+        ":amount": normalizedAmount,
+        ":applied_amount": 0,
+        ":advance_amount": -normalizedAmount,
+        ":date": date,
+        ":entry_type": "advance_deduction",
+        ":reference_sale_id": referenceSaleId ? String(referenceSaleId) : null,
+        ":note": createdUtang ? "Advance applied before creating utang." : "Advance fully covered checkout.",
+        ":ts": ts,
+      }
+    );
+  });
+
+  return String(customerRef.id);
 }
 
 export async function addUtangRecord(data: {
@@ -579,9 +771,14 @@ export async function addUtangRecord(data: {
   amount: number;
   balance: number;
   date: string;
+  forceCreditLimitOverride?: boolean;
 }) {
   await getDb();
   const scope = requireScope();
+  await assertUtangEnabled(scope);
+  if (!data.forceCreditLimitOverride) {
+    await assertWithinCustomerCreditLimit(scope, data.customerId, Math.max(0, Number(data.balance)));
+  }
   const id = toNumericId(data.id);
   const customerRef = await resolveExistingId("customers", data.customerId, scope);
   if (!customerRef.exists) {
@@ -608,42 +805,125 @@ export async function addUtangRecord(data: {
   return String(id);
 }
 
-export async function recordPayment(utangId: string, amount: number, date: string) {
+export async function recordPayment(customerId: string, amount: number, date: string) {
   await getDb();
   const scope = requireScope();
-  const paymentId = generateId();
   const ts = now();
-  const utangRef = await resolveExistingId("utang_records", utangId, scope);
-  if (!utangRef.exists) {
-    throw new Error(`Cannot record payment: utang record not found (${utangId})`);
+  const normalizedAmount = Math.max(0, Number(amount || 0));
+  if (normalizedAmount <= 0) return null;
+
+  const customerRef = await resolveExistingId("customers", customerId, scope);
+  if (!customerRef.exists) {
+    throw new Error(`Cannot record payment: customer not found (${customerId})`);
   }
 
+  const paymentHistoryId = generateId();
+
   await runTransaction(db => {
-    db.run(
-      `INSERT INTO utang_payments (id, account_id, store_id, utang_id, amount, date, updated_at, is_dirty)
-       VALUES (:id, :account_id, :store_id, :utang_id, :amount, :date, :ts, 1)`,
+    const unpaidRecords = execRows(
+      db as any,
+      `SELECT id, balance, amount, date
+       FROM utang_records
+       WHERE customer_id = :customer_id
+         AND account_id = :account_id
+         AND store_id = :store_id
+         AND balance > 0
+       ORDER BY date ASC, id ASC`,
       {
-        ":id": paymentId,
+        ":customer_id": customerRef.id,
         ...scopeParams(scope),
-        ":utang_id": utangRef.id,
-        ":amount": amount,
-        ":date": date,
-        ":ts": ts,
       }
     );
+
+    let remaining = normalizedAmount;
+    let appliedTotal = 0;
+
+    for (const record of unpaidRecords) {
+      if (remaining <= 0) break;
+      const balance = Number(record.balance || 0);
+      if (balance <= 0) continue;
+      const applied = Math.min(balance, remaining);
+      if (applied <= 0) continue;
+
+      db.run(
+        `INSERT INTO utang_payments (id, account_id, store_id, utang_id, amount, date, updated_at, is_dirty)
+         VALUES (:id, :account_id, :store_id, :utang_id, :amount, :date, :ts, 1)`,
+        {
+          ":id": generateId(),
+          ...scopeParams(scope),
+          ":utang_id": record.id,
+          ":amount": applied,
+          ":date": date,
+          ":ts": ts,
+        }
+      );
+
+      db.run(
+        `UPDATE utang_records
+         SET balance = CASE
+             WHEN balance - :amount < 0 THEN 0
+             ELSE balance - :amount
+           END,
+           updated_at = :ts,
+           is_dirty = 1
+         WHERE id = :utang_id
+           AND account_id = :account_id
+           AND store_id = :store_id`,
+        {
+          ":amount": applied,
+          ":ts": ts,
+          ":utang_id": record.id,
+          ...scopeParams(scope),
+        }
+      );
+
+      remaining -= applied;
+      appliedTotal += applied;
+    }
+
+    const advanceAmount = Math.max(0, remaining);
+    if (advanceAmount > 0) {
+      db.run(
+        `UPDATE customers
+         SET advance_balance = COALESCE(advance_balance, 0) + :advance_amount,
+             updated_at = :ts,
+             is_dirty = 1
+         WHERE id = :customer_id
+           AND account_id = :account_id
+           AND store_id = :store_id`,
+        {
+          ":advance_amount": advanceAmount,
+          ":ts": ts,
+          ":customer_id": customerRef.id,
+          ...scopeParams(scope),
+        }
+      );
+    }
+
     db.run(
-      `UPDATE utang_records
-       SET balance = balance - :amount, updated_at = :ts, is_dirty = 1
-       WHERE id = :utang_id AND account_id = :account_id AND store_id = :store_id`,
+      `INSERT INTO customer_payment_history (
+        id, account_id, store_id, customer_id, amount, applied_amount, advance_amount, date,
+        entry_type, reference_sale_id, note, updated_at, is_dirty
+      ) VALUES (
+        :id, :account_id, :store_id, :customer_id, :amount, :applied_amount, :advance_amount, :date,
+        :entry_type, :reference_sale_id, :note, :ts, 1
+      )`,
       {
-        ":amount": amount,
-        ":ts": ts,
-        ":utang_id": utangRef.id,
+        ":id": paymentHistoryId,
         ...scopeParams(scope),
+        ":customer_id": customerRef.id,
+        ":amount": normalizedAmount,
+        ":applied_amount": appliedTotal,
+        ":advance_amount": advanceAmount,
+        ":date": date,
+        ":entry_type": "payment",
+        ":reference_sale_id": null,
+        ":note": "Customer payment recorded.",
+        ":ts": ts,
       }
     );
   });
-  return String(paymentId);
+  return String(paymentHistoryId);
 }
 
 // Pabili orders

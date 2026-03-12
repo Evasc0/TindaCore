@@ -20,6 +20,7 @@ const defaultTables: Table[] = [
   "sale_items",
   "utang_records",
   "utang_payments",
+  "customer_payment_history",
   "pabili_orders",
   "expenses",
 ];
@@ -93,8 +94,8 @@ async function syncTables(tables: Table[]) {
 
 export const syncProducts = () => syncTables(["products", "product_barcodes"]);
 export const syncSales = () => syncTables(["sales", "sale_items"]);
-export const syncCustomers = () => syncTables(["customers"]);
-export const syncUtang = () => syncTables(["utang_records", "utang_payments"]);
+export const syncCustomers = () => syncTables(["customers", "customer_payment_history"]);
+export const syncUtang = () => syncTables(["utang_records", "utang_payments", "customer_payment_history"]);
 export const syncExpenses = () => syncTables(["expenses"]);
 export const syncPabili = () => syncTables(["pabili_orders"]);
 

@@ -147,6 +147,9 @@ create table if not exists customers (
   store_id text not null references stores(id) on delete cascade,
   name text not null,
   phone text,
+  note text,
+  credit_limit numeric,
+  advance_balance numeric default 0,
   updated_at bigint default floor(extract(epoch from now()) * 1000),
   is_dirty boolean default false,
   deleted boolean default false
@@ -185,6 +188,30 @@ create table if not exists utang_payments (
 );
 create index if not exists utang_payments_scope_idx on utang_payments (account_id, store_id);
 create index if not exists utang_payments_updated_at_idx on utang_payments (updated_at);
+
+-- Customer payment history
+create table if not exists customer_payment_history (
+  id text primary key,
+  account_id text not null references accounts(id) on delete cascade,
+  store_id text not null references stores(id) on delete cascade,
+  customer_id text not null references customers(id) on delete cascade,
+  amount numeric not null,
+  applied_amount numeric default 0,
+  advance_amount numeric default 0,
+  date text not null,
+  entry_type text not null default 'payment',
+  reference_sale_id text,
+  note text,
+  updated_at bigint default floor(extract(epoch from now()) * 1000),
+  is_dirty boolean default false,
+  deleted boolean default false
+);
+alter table customer_payment_history add column if not exists entry_type text not null default 'payment';
+alter table customer_payment_history add column if not exists reference_sale_id text;
+alter table customer_payment_history add column if not exists note text;
+create index if not exists customer_payment_history_scope_idx on customer_payment_history (account_id, store_id);
+create index if not exists customer_payment_history_customer_idx on customer_payment_history (customer_id);
+create index if not exists customer_payment_history_updated_at_idx on customer_payment_history (updated_at);
 
 -- Pabili orders
 create table if not exists pabili_orders (
@@ -234,5 +261,6 @@ alter table sale_items disable row level security;
 alter table customers disable row level security;
 alter table utang_records disable row level security;
 alter table utang_payments disable row level security;
+alter table customer_payment_history disable row level security;
 alter table pabili_orders disable row level security;
 alter table expenses disable row level security;

@@ -1,14 +1,13 @@
 import React, { useState, useRef, useEffect } from "react";
-import { useNavigate } from "react-router";
-import { Scan, Plus, Minus, Trash2, X, CheckCircle, Zap, Search } from "lucide-react";
+import { Scan, Plus, Minus, Trash2, X, CheckCircle, Zap, Search, ShieldAlert } from "lucide-react";
 import { useStore } from "../context/StoreContext";
 import { startScanner, stopScanner } from "../hardware/barcodeScanner";
 
 type Mode = "cart" | "complete" | "utang_select";
+type UtangType = "full" | "partial";
 
 export function POSScreen() {
-  const { products, cart, addToCart, removeFromCart, updateCartQty, completeSale, addUtangSale, customers, cartTotal, settings, t } = useStore();
-  const navigate = useNavigate();
+  const { products, cart, addToCart, removeFromCart, updateCartQty, completeSale, addUtangSale, addCustomer, customers, cartTotal, settings, t, getCustomerCreditStatus, verifyManagementPinForAction } = useStore();
   const isDark = settings.theme === "dark";
 
   const [mode, setMode] = useState<Mode>("cart");
@@ -21,8 +20,22 @@ export function POSScreen() {
   const [scanning, setScanning] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState<"cash" | "gcash" | "paymaya">("cash");
   const [searchTerm, setSearchTerm] = useState("");
+  const [utangType, setUtangType] = useState<UtangType>("full");
+  const [customerSearch, setCustomerSearch] = useState("");
+  const [partialPaidInput, setPartialPaidInput] = useState("");
+  const [utangWarning, setUtangWarning] = useState<string | null>(null);
+  const [overrideAttempt, setOverrideAttempt] = useState<{ customerId: string; amountPaid: number; applyAdvanceFirst: boolean } | null>(null);
+  const [showPinModal, setShowPinModal] = useState(false);
+  const [pinInput, setPinInput] = useState("");
+  const [pinError, setPinError] = useState<string | null>(null);
+  const [verifyingPin, setVerifyingPin] = useState(false);
+  const [showAddCustomerModal, setShowAddCustomerModal] = useState(false);
+  const [newCustomerName, setNewCustomerName] = useState("");
+  const [newCustomerPhone, setNewCustomerPhone] = useState("");
+  const [newCustomerNote, setNewCustomerNote] = useState("");
   const barcodeRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const utangScrollRef = useRef<HTMLDivElement>(null);
   const matchesBarcode = (product: { barcode?: string; barcodes?: string[] }, code: string) => {
     if (!code) return false;
     if ((product.barcode || "") === code) return true;
@@ -38,6 +51,22 @@ export function POSScreen() {
         (p.barcodes || []).some(code => code.includes(searchTerm))
       ).slice(0, 8)
     : [];
+  const filteredCustomers = customerSearch.trim()
+    ? customers.filter(c =>
+        c.name.toLowerCase().includes(customerSearch.toLowerCase()) ||
+        (c.phone || "").includes(customerSearch)
+      )
+    : customers;
+  const partialPaid = Math.max(0, Number(partialPaidInput || 0));
+  const remainingBalance = Math.max(0, cartTotal - partialPaid);
+  const partialInvalid = utangType === "partial" && (partialPaid <= 0 || partialPaid >= cartTotal);
+  const selectedCustomerData = selectedCustomer ? customers.find(customer => customer.id === selectedCustomer) : null;
+  const selectedAdvanceBalance = Math.max(0, Number(selectedCustomerData?.advanceBalance || 0));
+  const selectedUtangAmount = Math.max(0, cartTotal - (utangType === "partial" ? partialPaid : 0));
+  const selectedAdvanceUsed = Math.min(selectedAdvanceBalance, selectedUtangAmount);
+  const selectedRemainingAfterAdvance = Math.max(0, selectedUtangAmount - selectedAdvanceUsed);
+  const showAdvanceActions = !!selectedCustomer && selectedAdvanceBalance > 0 && selectedUtangAmount > 0;
+  const selectedCustomerCredit = selectedCustomer ? getCustomerCreditStatus(selectedCustomer) : null;
   const displayStock = (p: any) => {
     const factor =
       p.unit === "pack" || p.unit === "box"
@@ -93,6 +122,12 @@ export function POSScreen() {
     return () => handleStopScan();
   }, []);
 
+  useEffect(() => {
+    if (!settings.enableUtang && mode === "utang_select") {
+      setMode("cart");
+    }
+  }, [mode, settings.enableUtang]);
+
   const handleCompleteSale = () => {
     completeSale(parseFloat(paymentInput || "0"), paymentMethod);
     setPaymentInput("");
@@ -100,12 +135,122 @@ export function POSScreen() {
     setTimeout(() => { setShowSuccess(false); setMode("cart"); }, 2200);
   };
 
-  const handleAddUtang = () => {
-    if (!selectedCustomer) return;
-    addUtangSale(selectedCustomer);
+  const openUtangSelect = (type: UtangType) => {
+    setUtangType(type);
+    setMode("utang_select");
     setSelectedCustomer("");
-    setShowSuccess(true);
-    setTimeout(() => { setShowSuccess(false); setMode("cart"); }, 2200);
+    setCustomerSearch("");
+    setPartialPaidInput("");
+    setUtangWarning(null);
+    setOverrideAttempt(null);
+    setShowPinModal(false);
+    setPinInput("");
+    setPinError(null);
+    setShowAddCustomerModal(false);
+    setNewCustomerName("");
+    setNewCustomerPhone("");
+    setNewCustomerNote("");
+  };
+
+  const handleAddUtang = (
+    forceOverride = false,
+    attempt?: { customerId: string; amountPaid: number; applyAdvanceFirst: boolean },
+    applyAdvanceFirst = false
+  ) => {
+    const customerId = attempt?.customerId || selectedCustomer;
+    if (!customerId) return;
+    const amountPaid = attempt ? attempt.amountPaid : utangType === "partial" ? partialPaid : 0;
+    const shouldApplyAdvance = attempt ? attempt.applyAdvanceFirst : applyAdvanceFirst;
+    if (utangType === "partial" && amountPaid <= 0) {
+      setUtangWarning(
+        settings.language === "fil"
+          ? "Ilagay ang halagang binayad para sa partial payment."
+          : "Enter an amount paid for partial payment."
+      );
+      return;
+    }
+    if (utangType === "partial" && amountPaid >= cartTotal) {
+      setUtangWarning(
+        settings.language === "fil"
+          ? "Ang halagang binayad ay dapat mas mababa sa total."
+          : "Amount paid must be lower than total for partial payment."
+      );
+      return;
+    }
+
+    const result = addUtangSale(customerId, amountPaid, forceOverride, shouldApplyAdvance);
+    if (result.ok) {
+      setSelectedCustomer("");
+      setCustomerSearch("");
+      setPartialPaidInput("");
+      setUtangWarning(null);
+      setOverrideAttempt(null);
+      setShowSuccess(true);
+      setTimeout(() => { setShowSuccess(false); setMode("cart"); }, 2200);
+      return;
+    }
+
+    if (result.code === "credit_limit_exceeded") {
+      const available = result.credit?.availableCredit ?? 0;
+      setUtangWarning(
+        settings.language === "fil"
+          ? `Lumagpas sa credit limit. Natitirang available credit: \u20B1${available.toFixed(2)}.`
+          : `Credit limit exceeded. This customer has only \u20B1${available.toFixed(2)} available credit remaining.`
+      );
+      setOverrideAttempt({ customerId, amountPaid, applyAdvanceFirst: shouldApplyAdvance });
+      return;
+    }
+
+    if (result.code === "utang_disabled") {
+      setUtangWarning(settings.language === "fil" ? "Disabled ang utang feature." : "Utang feature is disabled.");
+      return;
+    }
+
+    setUtangWarning(settings.language === "fil" ? "Hindi ma-save ang utang." : "Unable to save utang transaction.");
+  };
+
+  const handleVerifyPinOverride = async () => {
+    if (!overrideAttempt) return;
+    if (!pinInput.trim()) {
+      setPinError(settings.language === "fil" ? "Ilagay ang management PIN." : "Enter management PIN.");
+      return;
+    }
+    setVerifyingPin(true);
+    setPinError(null);
+    try {
+      const ok = await verifyManagementPinForAction(pinInput.trim());
+      if (!ok) {
+        setPinError(settings.language === "fil" ? "Maling PIN." : "Invalid management PIN.");
+        return;
+      }
+      setShowPinModal(false);
+      setPinInput("");
+      handleAddUtang(true, overrideAttempt);
+    } finally {
+      setVerifyingPin(false);
+    }
+  };
+
+  const closeAddCustomerModal = () => {
+    setShowAddCustomerModal(false);
+    setNewCustomerName("");
+    setNewCustomerPhone("");
+    setNewCustomerNote("");
+  };
+
+  const handleSaveNewCustomer = () => {
+    const name = newCustomerName.trim();
+    if (!name) return;
+    const customerId = addCustomer(
+      name,
+      newCustomerPhone.trim() || undefined,
+      newCustomerNote.trim() || undefined
+    );
+    setSelectedCustomer(customerId);
+    setCustomerSearch(name);
+    setUtangWarning(null);
+    setOverrideAttempt(null);
+    closeAddCustomerModal();
   };
 
   // ── Success screen ──────────────────────────────────────────────────────────
@@ -125,78 +270,420 @@ export function POSScreen() {
   // ── Utang customer select ───────────────────────────────────────────────────
   if (mode === "utang_select") {
     return (
-      <div className="flex flex-col h-full" style={{ background: bg }}>
+      <div className="relative flex flex-col h-full" style={{ background: bg }}>
         {/* Header */}
-        <div style={{ background: card, borderBottom: `1px solid ${cardBorder}` }} className="px-5 pt-4 pb-4 flex items-center gap-3">
-          <button onClick={() => setMode("cart")} className="w-9 h-9 rounded-full flex items-center justify-center" style={{ background: subCard }}>
-            <X size={18} style={{ color: textMuted }} />
-          </button>
-          <div>
-            <p className="font-bold" style={{ color: text, fontSize: "18px" }}>{t.selectCustomer}</p>
-            <p className="text-xs" style={{ color: textMuted }}>
-              Total: <span style={{ color: "#d97706", fontWeight: 700 }}>₱{cartTotal.toFixed(2)}</span>
-            </p>
+        <div style={{ background: card, borderBottom: `1px solid ${cardBorder}` }} className="px-5 pt-4 pb-4">
+          <div className="flex items-center gap-3">
+            <button onClick={() => setMode("cart")} className="w-9 h-9 rounded-full flex items-center justify-center" style={{ background: subCard }}>
+              <X size={18} style={{ color: textMuted }} />
+            </button>
+            <div>
+              <p className="font-bold" style={{ color: text, fontSize: "18px" }}>{t.selectCustomer}</p>
+              <p className="text-xs" style={{ color: textMuted }}>
+                Total: <span style={{ color: "#d97706", fontWeight: 700 }}>{`\u20B1${cartTotal.toFixed(2)}`}</span>
+              </p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 mt-3">
+            <button
+              onClick={() => { setUtangType("full"); setPartialPaidInput(""); setUtangWarning(null); setOverrideAttempt(null); }}
+              className="py-2.5 rounded-xl font-semibold text-sm border transition-all"
+              style={{
+                background: utangType === "full" ? (isDark ? "#451a03" : "#fffbeb") : card,
+                borderColor: utangType === "full" ? "#d97706" : cardBorder,
+                color: utangType === "full" ? "#b45309" : textMuted,
+              }}
+            >
+              {t.addUtangBtn}
+            </button>
+            <button
+              onClick={() => { setUtangType("partial"); setUtangWarning(null); setOverrideAttempt(null); }}
+              className="py-2.5 rounded-xl font-semibold text-sm border transition-all"
+              style={{
+                background: utangType === "partial" ? (isDark ? "#1e3a8a" : "#eff6ff") : card,
+                borderColor: utangType === "partial" ? "#2563eb" : cardBorder,
+                color: utangType === "partial" ? "#1d4ed8" : textMuted,
+              }}
+            >
+              {t.partialPaymentBtn}
+            </button>
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-4">
-          {customers.map(c => {
-            const bal = c.transactions.filter(tx => tx.balance > 0).reduce((s, tx) => s + tx.balance, 0);
-            return (
-              <button
-                key={c.id}
-                onClick={() => setSelectedCustomer(c.id)}
-                className="w-full flex items-center justify-between p-4 mb-3 rounded-2xl border-2 transition-all text-left"
-                style={{
-                  background: selectedCustomer === c.id ? (isDark ? "#451a03" : "#fffbeb") : card,
-                  borderColor: selectedCustomer === c.id ? "#f59e0b" : cardBorder,
+        <div ref={utangScrollRef} className="flex-1 overflow-y-auto p-4">
+          {utangType === "partial" && (
+            <div className="rounded-2xl p-4 mb-3 border" style={{ background: card, borderColor: cardBorder }}>
+              <label className="text-xs font-semibold uppercase tracking-wider block mb-2" style={{ color: textMuted }}>
+                {t.amountPaidLabel}
+              </label>
+              <input
+                type="number"
+                min="0"
+                value={partialPaidInput}
+                onChange={e => {
+                  setPartialPaidInput(e.target.value);
+                  setUtangWarning(null);
+                  setOverrideAttempt(null);
                 }}
-              >
-                <div className="flex items-center gap-3">
-                  <div className="w-11 h-11 rounded-full flex items-center justify-center" style={{ background: isDark ? "#451a03" : "#fef3c7" }}>
-                    <span style={{ color: "#d97706", fontWeight: 700, fontSize: "14px" }}>{c.name.charAt(0)}</span>
-                  </div>
-                  <div>
-                    <p className="font-semibold" style={{ color: text }}>{c.name}</p>
-                    <p className="text-xs" style={{ color: textMuted }}>{c.phone || t.noPhone}</p>
-                  </div>
-                </div>
-                <div className="text-right">
-                  <p className="font-bold text-sm text-red-500">₱{bal.toFixed(2)}</p>
-                  <p className="text-xs" style={{ color: textMuted }}>{t.currentUtang}</p>
-                </div>
+                placeholder="0.00"
+                className="w-full outline-none font-black"
+                style={{ fontSize: "28px", background: "transparent", color: text }}
+              />
+              <p className="text-xs mt-2" style={{ color: textMuted }}>
+                {t.remainingBalance}: <span style={{ color: "#d97706", fontWeight: 700 }}>{`\u20B1${remainingBalance.toFixed(2)}`}</span>
+              </p>
+            </div>
+          )}
+
+          <div className="rounded-2xl flex items-center gap-3 px-4 py-3 border mb-3" style={{ background: card, borderColor: cardBorder }}>
+            <Search size={16} style={{ color: textMuted }} />
+            <input
+              type="text"
+              value={customerSearch}
+              onChange={e => setCustomerSearch(e.target.value)}
+              placeholder={t.searchCustomer}
+              className="flex-1 outline-none text-sm"
+              style={{ background: "transparent", color: text }}
+            />
+            {customerSearch && (
+              <button onClick={() => setCustomerSearch("")} className="text-xs font-semibold" style={{ color: textMuted }}>
+                Clear
               </button>
-            );
-          })}
+            )}
+          </div>
+
+          {selectedCustomerCredit && (
+            <div className="rounded-2xl p-3 mt-3 border" style={{ background: card, borderColor: cardBorder }}>
+              <p className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: textMuted }}>
+                {settings.language === "fil" ? "Customer Summary" : "Customer Summary"}
+              </p>
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div className="rounded-xl p-2" style={{ background: subCard }}>
+                  <p style={{ color: textMuted }}>{settings.language === "fil" ? "Outstanding Utang" : "Outstanding Utang"}</p>
+                  <p className="font-semibold" style={{ color: text }}>{`\u20B1${selectedCustomerCredit.currentBalance.toFixed(2)}`}</p>
+                </div>
+                <div className="rounded-xl p-2" style={{ background: subCard }}>
+                  <p style={{ color: textMuted }}>{settings.language === "fil" ? "Advance Balance" : "Advance Balance"}</p>
+                  <p className="font-semibold" style={{ color: text }}>{`\u20B1${selectedAdvanceBalance.toFixed(2)}`}</p>
+                </div>
+                <div className="rounded-xl p-2" style={{ background: subCard }}>
+                  <p style={{ color: textMuted }}>{settings.language === "fil" ? "Credit Limit" : "Credit Limit"}</p>
+                  <p className="font-semibold" style={{ color: text }}>
+                    {selectedCustomerCredit.creditLimit === null ? "No limit" : `\u20B1${selectedCustomerCredit.creditLimit.toFixed(2)}`}
+                  </p>
+                </div>
+                <div className="rounded-xl p-2" style={{ background: subCard }}>
+                  <p style={{ color: textMuted }}>{settings.language === "fil" ? "Cart Total" : "Cart Total"}</p>
+                  <p className="font-semibold" style={{ color: text }}>{`\u20B1${cartTotal.toFixed(2)}`}</p>
+                </div>
+                <div className="rounded-xl p-2 col-span-2" style={{ background: subCard }}>
+                  <p style={{ color: textMuted }}>{settings.language === "fil" ? "Available Credit" : "Available Credit"}</p>
+                  <p className="font-semibold" style={{ color: text }}>
+                    {selectedCustomerCredit.availableCredit === null ? "Unlimited" : `\u20B1${selectedCustomerCredit.availableCredit.toFixed(2)}`}
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {showAdvanceActions && (
+            <div className="rounded-2xl p-3 mt-3 border" style={{ background: card, borderColor: cardBorder }}>
+              <p className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: textMuted }}>
+                {settings.language === "fil" ? "Advance Balance Action" : "Advance Balance Action"}
+              </p>
+              <p className="text-xs mb-3" style={{ color: textMuted }}>
+                {selectedRemainingAfterAdvance <= 0
+                  ? (settings.language === "fil"
+                      ? `Maaaring i-cover ng advance ang buong \u20B1${selectedUtangAmount.toFixed(2)}. Walang bagong utang na gagawin.`
+                      : `Advance can fully cover \u20B1${selectedUtangAmount.toFixed(2)}. No new utang will be created.`)
+                  : (settings.language === "fil"
+                      ? `Advance na magagamit: \u20B1${selectedAdvanceUsed.toFixed(2)}. Natitirang utang: \u20B1${selectedRemainingAfterAdvance.toFixed(2)}.`
+                      : `Advance to use: \u20B1${selectedAdvanceUsed.toFixed(2)}. Remaining utang: \u20B1${selectedRemainingAfterAdvance.toFixed(2)}.`)}
+              </p>
+              <div className="grid grid-cols-1 gap-2">
+                <button
+                  onClick={() => handleAddUtang(false, undefined, true)}
+                  disabled={partialInvalid}
+                  className="w-full py-2.5 rounded-xl font-semibold text-white disabled:opacity-40"
+                  style={{ background: "linear-gradient(135deg, #d97706 0%, #b45309 100%)" }}
+                >
+                  {settings.language === "fil" ? "Use Advance First" : "Use Advance First"}
+                </button>
+                <button
+                  onClick={() => handleAddUtang(false, undefined, false)}
+                  disabled={partialInvalid}
+                  className="w-full py-2.5 rounded-xl font-semibold border disabled:opacity-40"
+                  style={{ borderColor: cardBorder, color: text }}
+                >
+                  {settings.language === "fil" ? "Create Full Utang" : "Create Full Utang"}
+                </button>
+                <button
+                  onClick={() => {
+                    setSelectedCustomer("");
+                    setUtangWarning(null);
+                    setOverrideAttempt(null);
+                  }}
+                  className="w-full py-2.5 rounded-xl font-semibold"
+                  style={{ background: isDark ? "#374151" : "#f3f4f6", color: text }}
+                >
+                  {settings.language === "fil" ? "Cancel" : "Cancel"}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {filteredCustomers.length === 0 ? (
+            <div className="rounded-2xl p-4 text-sm text-center border" style={{ background: card, borderColor: cardBorder, color: textMuted }}>
+              {settings.language === "fil" ? "Walang customer na nakita." : "No customers found."}
+            </div>
+          ) : (
+            filteredCustomers.map(c => {
+              const credit = getCustomerCreditStatus(c.id);
+              return (
+                <button
+                  key={c.id}
+                  onClick={() => {
+                    setSelectedCustomer(c.id);
+                    setUtangWarning(null);
+                    setOverrideAttempt(null);
+                    requestAnimationFrame(() => {
+                      utangScrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+                    });
+                  }}
+                  className="w-full flex items-center justify-between p-4 mb-3 rounded-2xl border-2 transition-all text-left"
+                  style={{
+                    background: selectedCustomer === c.id ? (isDark ? "#451a03" : "#fffbeb") : card,
+                    borderColor: selectedCustomer === c.id ? "#f59e0b" : cardBorder,
+                  }}
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="w-11 h-11 rounded-full flex items-center justify-center" style={{ background: isDark ? "#451a03" : "#fef3c7" }}>
+                      <span style={{ color: "#d97706", fontWeight: 700, fontSize: "14px" }}>{c.name.charAt(0)}</span>
+                    </div>
+                    <div>
+                      <p className="font-semibold" style={{ color: text }}>{c.name}</p>
+                      <p className="text-xs" style={{ color: textMuted }}>{c.phone || t.noPhone}</p>
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <p className="font-bold text-sm text-red-500">{`\u20B1${credit.currentBalance.toFixed(2)}`}</p>
+                    <p className="text-[11px]" style={{ color: textMuted }}>
+                      {settings.language === "fil" ? "Available" : "Available"}: {credit.availableCredit === null ? "Unlimited" : `\u20B1${credit.availableCredit.toFixed(2)}`}
+                    </p>
+                  </div>
+                </button>
+              );
+            })
+          )}
+
           <button
-            onClick={() => navigate("/utang")}
+            onClick={() => setShowAddCustomerModal(true)}
             className="w-full flex items-center justify-center gap-2 p-4 rounded-2xl border-2 border-dashed"
             style={{ borderColor: isDark ? "#374151" : "#e5e7eb", color: textMuted }}
           >
             <Plus size={16} />
             <span className="text-sm">{t.addNewCustomer}</span>
           </button>
+
+          {utangWarning && (
+            <div
+              className="rounded-2xl p-3 mt-3 border"
+              style={{
+                background: isDark ? "#450a0a" : "#fff7ed",
+                borderColor: isDark ? "#7f1d1d" : "#fed7aa",
+              }}
+            >
+              <div className="flex items-start gap-2">
+                <ShieldAlert size={16} className="mt-0.5" style={{ color: "#d97706" }} />
+                <p className="text-sm" style={{ color: isDark ? "#fed7aa" : "#9a3412" }}>{utangWarning}</p>
+              </div>
+              {overrideAttempt && (
+                <button
+                  onClick={() => {
+                    setShowPinModal(true);
+                    setPinError(null);
+                    setPinInput("");
+                  }}
+                  className="mt-3 px-3 py-2 rounded-xl text-xs font-semibold border"
+                  style={{ borderColor: "#d97706", color: "#d97706" }}
+                >
+                  {settings.language === "fil" ? "Override gamit ang Management PIN" : "Override with Management PIN"}
+                </button>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="p-4" style={{ background: card, borderTop: `1px solid ${cardBorder}` }}>
-          <button
-            onClick={handleAddUtang}
-            disabled={!selectedCustomer}
-            className="w-full py-4 rounded-2xl font-bold text-white transition-all active:scale-95 disabled:opacity-40"
-            style={{
-              background: selectedCustomer ? "linear-gradient(135deg, #d97706 0%, #b45309 100%)" : "#d1d5db",
-              fontSize: "16px",
-              boxShadow: selectedCustomer ? "0 4px 16px rgba(217,119,6,0.4)" : "none",
-            }}
-          >
-            {t.saveUtang} ₱{cartTotal.toFixed(2)}
-          </button>
+          {showAdvanceActions ? (
+            <div className="text-center text-xs" style={{ color: textMuted }}>
+              {settings.language === "fil"
+                ? "Pumili ng action sa Advance Balance options sa itaas."
+                : "Choose an action in the Advance Balance options above."}
+            </div>
+          ) : (
+            <button
+              onClick={() => handleAddUtang()}
+              disabled={!selectedCustomer || partialInvalid}
+              className="w-full py-4 rounded-2xl font-bold text-white transition-all active:scale-95 disabled:opacity-40"
+              style={{
+                background: selectedCustomer && !partialInvalid
+                  ? "linear-gradient(135deg, #d97706 0%, #b45309 100%)"
+                  : "#d1d5db",
+                fontSize: "16px",
+                boxShadow: selectedCustomer && !partialInvalid ? "0 4px 16px rgba(217,119,6,0.4)" : "none",
+              }}
+            >
+              {utangType === "partial"
+                ? `${t.savePartialPayment} \u20B1${remainingBalance.toFixed(2)}`
+                : `${t.saveUtang} \u20B1${cartTotal.toFixed(2)}`}
+            </button>
+          )}
         </div>
+
+        {showAddCustomerModal && (
+          <div className="absolute inset-0 flex items-end z-50" style={{ background: "rgba(0,0,0,0.55)" }}>
+            <div className="w-full rounded-t-3xl p-6" style={{ background: card }}>
+              <div className="flex items-center justify-between mb-5">
+                <h3 className="font-bold text-lg" style={{ color: text }}>{t.newCustomer}</h3>
+                <button
+                  onClick={closeAddCustomerModal}
+                  className="w-8 h-8 rounded-full flex items-center justify-center"
+                  style={{ background: isDark ? "#374151" : "#f3f4f6" }}
+                >
+                  <X size={16} style={{ color: textMuted }} />
+                </button>
+              </div>
+
+              <div className="mb-4">
+                <label className="text-xs font-semibold uppercase tracking-wider block mb-2" style={{ color: textMuted }}>
+                  {t.customerName} <span className="text-red-400">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={newCustomerName}
+                  onChange={e => setNewCustomerName(e.target.value)}
+                  placeholder={t.customerNamePlaceholder}
+                  className="w-full rounded-xl px-4 py-3 outline-none text-sm border"
+                  style={{ background: isDark ? "#374151" : "#f9fafb", color: text, borderColor: cardBorder }}
+                  autoFocus
+                />
+              </div>
+
+              <div className="mb-4">
+                <label className="text-xs font-semibold uppercase tracking-wider block mb-2" style={{ color: textMuted }}>
+                  {t.phoneNumber}
+                </label>
+                <input
+                  type="tel"
+                  value={newCustomerPhone}
+                  onChange={e => setNewCustomerPhone(e.target.value)}
+                  placeholder={t.phonePlaceholder}
+                  className="w-full rounded-xl px-4 py-3 outline-none text-sm border"
+                  style={{ background: isDark ? "#374151" : "#f9fafb", color: text, borderColor: cardBorder }}
+                />
+              </div>
+
+              <div className="mb-6">
+                <label className="text-xs font-semibold uppercase tracking-wider block mb-2" style={{ color: textMuted }}>
+                  {t.customerNote}
+                </label>
+                <textarea
+                  value={newCustomerNote}
+                  onChange={e => setNewCustomerNote(e.target.value)}
+                  placeholder={t.customerNotePlaceholder}
+                  className="w-full rounded-xl px-4 py-3 outline-none text-sm border resize-none"
+                  style={{ background: isDark ? "#374151" : "#f9fafb", color: text, borderColor: cardBorder }}
+                  rows={3}
+                />
+              </div>
+
+              <div className="flex gap-3">
+                <button
+                  onClick={closeAddCustomerModal}
+                  className="flex-1 py-3 rounded-2xl font-semibold"
+                  style={{ background: isDark ? "#374151" : "#f3f4f6", color: text }}
+                >
+                  {t.cancelBtn}
+                </button>
+                <button
+                  onClick={handleSaveNewCustomer}
+                  disabled={!newCustomerName.trim()}
+                  className="flex-1 py-3 rounded-2xl font-semibold text-white disabled:opacity-40"
+                  style={{ background: "linear-gradient(135deg, #d97706 0%, #b45309 100%)" }}
+                >
+                  {t.saveCustomer}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {showPinModal && (
+          <div className="absolute inset-0 flex items-end z-50" style={{ background: "rgba(0,0,0,0.55)" }}>
+            <div className="w-full rounded-t-3xl p-6" style={{ background: card }}>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="font-bold" style={{ color: text, fontSize: "18px" }}>
+                  {settings.language === "fil" ? "Management Override" : "Management Override"}
+                </h3>
+                <button
+                  onClick={() => {
+                    setShowPinModal(false);
+                    setPinInput("");
+                    setPinError(null);
+                  }}
+                  className="w-8 h-8 rounded-full flex items-center justify-center"
+                  style={{ background: isDark ? "#374151" : "#f3f4f6" }}
+                >
+                  <X size={16} style={{ color: textMuted }} />
+                </button>
+              </div>
+              <p className="text-sm mb-3" style={{ color: textMuted }}>
+                {settings.language === "fil"
+                  ? "Ilagay ang management PIN para ituloy ang utang na lampas sa limit."
+                  : "Enter the management PIN to continue this over-limit utang."}
+              </p>
+              <input
+                type="password"
+                inputMode="numeric"
+                value={pinInput}
+                onChange={e => setPinInput(e.target.value)}
+                placeholder={settings.language === "fil" ? "Management PIN" : "Management PIN"}
+                className="w-full rounded-xl px-4 py-3 outline-none text-sm border"
+                style={{ background: isDark ? "#374151" : "#f9fafb", color: text, borderColor: cardBorder }}
+              />
+              {pinError && <p className="text-xs mt-2" style={{ color: "#dc2626" }}>{pinError}</p>}
+              <div className="flex gap-3 mt-4">
+                <button
+                  onClick={() => {
+                    setShowPinModal(false);
+                    setPinInput("");
+                    setPinError(null);
+                  }}
+                  className="flex-1 py-3 rounded-2xl font-semibold"
+                  style={{ background: isDark ? "#374151" : "#f3f4f6", color: text }}
+                >
+                  {t.cancelBtn}
+                </button>
+                <button
+                  onClick={handleVerifyPinOverride}
+                  disabled={verifyingPin}
+                  className="flex-1 py-3 rounded-2xl bg-blue-600 text-white font-semibold disabled:opacity-40"
+                >
+                  {verifyingPin
+                    ? (settings.language === "fil" ? "Verifying..." : "Verifying...")
+                    : (settings.language === "fil" ? "Verify PIN" : "Verify PIN")}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     );
   }
 
-  // ── Complete sale screen ───────────────────────────────────────────────────
+  // Complete sale screen ───────────────────────────────────────────────────
   if (mode === "complete") {
     return (
       <div className="flex flex-col h-full" style={{ background: bg }}>
@@ -570,29 +1057,45 @@ export function POSScreen() {
           </div>
         )}
         <div className="flex gap-2">
-          <button
-            onClick={() => setMode("utang_select")}
-            disabled={cart.length === 0}
-            className="flex-1 py-3.5 rounded-2xl font-bold text-white transition-all active:scale-95 disabled:opacity-40"
-            style={{
-              background: "linear-gradient(135deg, #d97706 0%, #b45309 100%)",
-              boxShadow: cart.length > 0 ? "0 4px 12px rgba(217,119,6,0.35)" : "none",
-              fontSize: "14px",
-            }}
-          >
-            📋 {t.addUtangBtn}
-          </button>
+          {settings.enableUtang && (
+            <>
+              <button
+                onClick={() => openUtangSelect("full")}
+                disabled={cart.length === 0}
+                className="flex-1 py-3.5 rounded-2xl font-bold text-white transition-all active:scale-95 disabled:opacity-40"
+                style={{
+                  background: "linear-gradient(135deg, #d97706 0%, #b45309 100%)",
+                  boxShadow: cart.length > 0 ? "0 4px 12px rgba(217,119,6,0.35)" : "none",
+                  fontSize: "14px",
+                }}
+              >
+                {t.addUtangBtn}
+              </button>
+              <button
+                onClick={() => openUtangSelect("partial")}
+                disabled={cart.length === 0}
+                className="flex-1 py-3.5 rounded-2xl font-bold text-white transition-all active:scale-95 disabled:opacity-40"
+                style={{
+                  background: "linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%)",
+                  boxShadow: cart.length > 0 ? "0 4px 12px rgba(37,99,235,0.35)" : "none",
+                  fontSize: "14px",
+                }}
+              >
+                {t.partialPaymentBtn}
+              </button>
+            </>
+          )}
           <button
             onClick={() => setMode("complete")}
             disabled={cart.length === 0}
-            className="flex-[2] py-3.5 rounded-2xl font-bold text-white transition-all active:scale-95 disabled:opacity-40"
+            className={`${settings.enableUtang ? "flex-[2]" : "flex-1"} py-3.5 rounded-2xl font-bold text-white transition-all active:scale-95 disabled:opacity-40`}
             style={{
               background: "linear-gradient(135deg, #16a34a 0%, #15803d 100%)",
               boxShadow: cart.length > 0 ? "0 4px 12px rgba(22,163,74,0.35)" : "none",
               fontSize: "15px",
             }}
           >
-            {cart.length === 0 ? `✓ ${t.completeSale}` : `✓ ${t.paidBadge}${cartTotal.toFixed(2)}`}
+            {cart.length === 0 ? t.completeSale : `${t.paidBadge}${cartTotal.toFixed(2)}`}
           </button>
         </div>
       </div>
