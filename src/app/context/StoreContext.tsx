@@ -38,6 +38,25 @@ import {
 import { syncAll } from "../sync/syncService";
 import { generateRestockSuggestions, RestockSuggestion } from "../ai/restockEngine";
 import {
+  addProductToRestockList as persistAddProductToRestockList,
+  assignSupplierToRestockList as persistAssignSupplierToRestockList,
+  calculateRestockBudget as persistCalculateRestockBudget,
+  confirmRestockList as persistConfirmRestockList,
+  createRestockList as persistCreateRestockList,
+  createSupplier as persistCreateSupplier,
+  generateSmartRestockSuggestions as persistGenerateSmartRestockSuggestions,
+  getActiveRestockList as loadActiveRestockList,
+  getRestockHistory as loadRestockHistoryRecords,
+  getSuppliers as loadSuppliersRecords,
+  removeRestockItem as persistRemoveRestockItem,
+  type ConfirmRestockInput,
+  type RestockBudgetSummary,
+  type RestockHistoryRecord,
+  type RestockListItem as RestockDbItem,
+  type SupplierRecord,
+  updateRestockItem as persistUpdateRestockItem,
+} from "../services/restockService";
+import {
   computeProductProfitability,
   topProfitable,
   leastProfitable,
@@ -53,18 +72,6 @@ import {
 } from "../analytics/hourlySales";
 import { computeCommunityProductStats, CommunityProductStats } from "../analytics/communityAnalytics";
 import { buildBenchmark, StorePerformance } from "../analytics/benchmarkEngine";
-import {
-  Supplier,
-  SupplierProduct,
-  RestockOrder,
-  RestockOrderItem,
-  RestockOrderStatus,
-  buildSuggestedSuppliers,
-  createRestockOrder,
-  updateRestockOrderStatus as applyRestockOrderStatus,
-  formatRestockMessage,
-} from "../marketplace/marketplaceService";
-import { ChatMessage, sendMessage as sendChatMessage, getConversation, getAllMessages } from "../marketplace/chatService";
 
 export type Unit = "piece" | "pack" | "box" | "cavan" | "kg" | "grams" | "ml" | "liters";
 type BaseUnit = "piece" | "grams" | "ml";
@@ -176,13 +183,45 @@ export interface Expense {
 }
 
 export interface RestockItem {
+  id: string;
+  restockListId: string;
   productId: string;
   productName: string;
   emoji: string;
+  unit: string;
   suggestedQty: number;
   editedQty: number;
+  purchasedQty: number;
+  estimatedUnitCost: number;
+  actualUnitCost: number;
   estimatedCost: number;
+  actualCost: number;
   checked: boolean;
+  status: "draft" | "confirmed";
+  missingPrice?: boolean;
+}
+
+export interface Supplier {
+  id: string;
+  name: string;
+  location?: string;
+  contactNumber?: string;
+  notes?: string;
+}
+
+export interface RestockHistoryEntry {
+  id: string;
+  productId: string;
+  productName: string;
+  productEmoji: string;
+  supplierId: string | null;
+  supplierName: string | null;
+  quantity: number;
+  unit: string;
+  unitCost: number;
+  totalCost: number;
+  restockListId: string | null;
+  createdAt: string;
 }
 
 export type SubscriptionTier = "free" | "plus" | "premium";
@@ -813,6 +852,48 @@ const formatStockDisplay = (product: Product) => {
   }
   return Math.floor(sellingQty);
 };
+
+const mapRestockDbItemToStoreItem = (item: RestockDbItem): RestockItem => ({
+  id: item.id,
+  restockListId: item.restockListId,
+  productId: item.productId,
+  productName: item.productName,
+  emoji: item.productEmoji,
+  unit: item.unit,
+  suggestedQty: item.suggestedQty,
+  editedQty: item.editedQty,
+  purchasedQty: item.purchasedQty,
+  estimatedUnitCost: item.estimatedUnitCost,
+  actualUnitCost: item.actualUnitCost,
+  estimatedCost: item.estimatedItemTotal,
+  actualCost: item.actualItemTotal,
+  checked: item.isChecked,
+  status: item.status,
+});
+
+const mapSupplierRecordToStoreSupplier = (record: SupplierRecord): Supplier => ({
+  id: record.id,
+  name: record.name,
+  location: record.location || "",
+  contactNumber: record.contactNumber || "",
+  notes: record.notes || "",
+});
+
+const mapRestockHistoryRecord = (record: RestockHistoryRecord): RestockHistoryEntry => ({
+  id: record.id,
+  productId: record.productId,
+  productName: record.productName,
+  productEmoji: record.productEmoji,
+  supplierId: record.supplierId,
+  supplierName: record.supplierName,
+  quantity: record.quantity,
+  unit: record.unit,
+  unitCost: record.unitCost,
+  totalCost: record.totalCost,
+  restockListId: record.restockListId,
+  createdAt: record.createdAt,
+});
+
 export function canAccess(subscription: SubscriptionTier, required: SubscriptionTier): boolean {
   const order: SubscriptionTier[] = ["free", "plus", "premium"];
   return order.indexOf(subscription) >= order.indexOf(required);
@@ -827,9 +908,12 @@ interface StoreContextType {
   pabiliOrders: PabiliOrder[];
   expenses: Expense[];
   restockList: RestockItem[];
+  activeRestockListId: string | null;
+  activeRestockSupplierId: string | null;
+  smartRestockSuggestions: RestockSuggestion[];
   suppliers: Supplier[];
-  restockOrders: RestockOrder[];
-  chatMessages: ChatMessage[];
+  restockHistory: RestockHistoryEntry[];
+  restockBudget: RestockBudgetSummary | null;
   settings: StoreSettings;
   t: typeof translations["en"];
   currentAccount: AccountRecord | null;
@@ -895,14 +979,17 @@ interface StoreContextType {
   addPabiliOrder: (order: Omit<PabiliOrder, "id">) => void;
   updatePabiliStatus: (id: string, status: PabiliOrder["status"]) => void;
   // Restock
-  updateRestockList: (items: RestockItem[]) => void;
-  checkRestockItem: (productId: string, checked: boolean, purchasedQty: number) => void;
-  // Marketplace
-  placeRestockOrder: (supplierId: string, items: RestockOrderItem[]) => RestockOrder | null;
-  updateRestockOrderStatus: (orderId: string, status: RestockOrderStatus) => void;
-  getSupplierCatalog: () => SupplierProduct[];
-  sendChat: (input: Omit<ChatMessage, "id" | "timestamp"> & { id?: string; timestamp?: string }) => ChatMessage;
-  getConversation: (a: string, b: string) => ChatMessage[];
+  generateSmartRestockSuggestions: () => Promise<RestockSuggestion[]>;
+  createRestockList: (supplierId?: string) => Promise<void>;
+  addProductToRestockList: (productId: string, qty: number, unit?: string) => Promise<void>;
+  updateRestockItem: (restockItemId: string, fields: Partial<RestockItem>) => Promise<void>;
+  removeRestockItem: (restockItemId: string) => Promise<void>;
+  assignSupplierToRestockList: (supplierId: string) => Promise<void>;
+  calculateRestockBudget: () => Promise<RestockBudgetSummary | null>;
+  confirmRestock: (actualCostsByItem: ConfirmRestockInput) => Promise<boolean>;
+  loadRestockHistory: () => Promise<void>;
+  loadSuppliers: () => Promise<void>;
+  createSupplier: (payload: { name: string; location?: string; contactNumber?: string; notes?: string }) => Promise<void>;
   // Expenses
   addExpense: (e: Omit<Expense, "id">) => void;
   // Analytics
@@ -1120,9 +1207,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [pabiliOrders, setPabiliOrders] = useState<PabiliOrder[]>([]);
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [restockList, setRestockList] = useState<RestockItem[]>([]);
+  const [activeRestockListId, setActiveRestockListId] = useState<string | null>(null);
+  const [activeRestockSupplierId, setActiveRestockSupplierId] = useState<string | null>(null);
+  const [smartRestockSuggestions, setSmartRestockSuggestions] = useState<RestockSuggestion[]>([]);
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
-  const [restockOrders, setRestockOrders] = useState<RestockOrder[]>([]);
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [restockHistory, setRestockHistory] = useState<RestockHistoryEntry[]>([]);
+  const [restockBudget, setRestockBudget] = useState<RestockBudgetSummary | null>(null);
   const [settings, setSettings] = useState<StoreSettings>({
     ...initialSettings,
     managementPIN: "",
@@ -1150,8 +1240,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setPabiliOrders([]);
     setExpenses([]);
     setRestockList([]);
+    setActiveRestockListId(null);
+    setActiveRestockSupplierId(null);
+    setSmartRestockSuggestions([]);
     setSuppliers([]);
-    setRestockOrders([]);
+    setRestockHistory([]);
+    setRestockBudget(null);
     setManagementUnlocked(false);
     setOperatingUserState("Helper");
     setSettings({
@@ -1176,14 +1270,39 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const hydrateScopedData = useCallback(async (bundle: AuthSessionBundle) => {
     setDataScope({ accountId: bundle.account.id, storeId: bundle.store.id });
-    const [dbProducts, dbCustomers, dbSales, dbPabili, dbExpenses, savedSettings] = await Promise.all([
+    const [
+      dbProducts,
+      dbCustomers,
+      dbSales,
+      dbPabili,
+      dbExpenses,
+      savedSettings,
+      supplierRows,
+      restockHistoryRows,
+      initialActiveRestockList,
+    ] = await Promise.all([
       loadProducts(),
       loadCustomers(),
       loadSales(),
       loadPabiliOrders(),
       loadExpenses(),
       loadSettings(),
+      loadSuppliersRecords(bundle.store.id),
+      loadRestockHistoryRecords(bundle.store.id),
+      loadActiveRestockList(bundle.store.id),
     ]);
+    let activeRestockList = initialActiveRestockList;
+    let budgetSnapshot: RestockBudgetSummary | null = null;
+    if (activeRestockList) {
+      budgetSnapshot = await persistCalculateRestockBudget(activeRestockList.id).catch(() => null);
+      activeRestockList = await loadActiveRestockList(bundle.store.id, activeRestockList.id);
+    }
+    const liveSuggestions = generateRestockSuggestions(dbProducts, dbSales, {
+      lookbackDays: 7,
+      targetRestockDays: 7,
+      thresholdDays: 7,
+      includeNoSalesFallback: true,
+    });
     const fallback = buildScopedDefaultSettings(bundle.account, bundle.store);
     const resolved = savedSettings
       ? {
@@ -1204,7 +1323,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setSales(dbSales);
     setPabiliOrders(dbPabili);
     setExpenses(dbExpenses);
-    setSuppliers(buildSuggestedSuppliers(dbProducts));
+    setRestockList((activeRestockList?.items || []).map(mapRestockDbItemToStoreItem));
+    setActiveRestockListId(activeRestockList?.id || null);
+    setActiveRestockSupplierId(activeRestockList?.supplierId || null);
+    setSmartRestockSuggestions(liveSuggestions);
+    setSuppliers(supplierRows.map(mapSupplierRecordToStoreSupplier));
+    setRestockHistory(restockHistoryRows.map(mapRestockHistoryRecord));
+    setRestockBudget(budgetSnapshot);
     setOperatingUserState(bundle.account.ownerName || "Helper");
     setManagementUnlocked(false);
     await syncAll().catch(err => console.debug("Initial sync skipped", err));
@@ -1276,12 +1401,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   useEffect(() => {
-    setSuppliers(buildSuggestedSuppliers(products));
-  }, [products]);
-
-  useEffect(() => {
-    setChatMessages(getAllMessages());
-  }, []);
+    setSmartRestockSuggestions(
+      generateRestockSuggestions(products, sales, {
+        lookbackDays: 7,
+        targetRestockDays: 7,
+        thresholdDays: 7,
+        includeNoSalesFallback: true,
+      })
+    );
+  }, [products, sales]);
 
   const verifyManagementPin = useCallback(async (pin: string) => {
     if (!currentStore) return false;
@@ -1910,60 +2038,188 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // Restock
-  const updateRestockList = useCallback((items: RestockItem[]) => {
-    setRestockList(items);
-  }, []);
-  const checkRestockItem = useCallback((productId: string, checked: boolean, purchasedQty: number) => {
-    setRestockList(prev => prev.map(i => i.productId === productId ? { ...i, checked } : i));
-    if (checked && purchasedQty > 0) {
-      setProducts(prev => prev.map(p => {
-        if (p.id !== productId) return p;
-        return { ...p, stock: p.stock + toBaseUnits(p, purchasedQty) };
-      }));
-      const product = products.find(p => p.id === productId);
-      if (product) {
-        const updatedStock = product.stock + toBaseUnits(product, purchasedQty);
-        void updateProductRecord(productId, { stock: updatedStock });
-        void syncAll().catch(() => {});
-      }
+  const refreshActiveRestock = useCallback(async (preferredListId?: string) => {
+    if (!currentStore) {
+      setActiveRestockListId(null);
+      setActiveRestockSupplierId(null);
+      setRestockList([]);
+      setRestockBudget(null);
+      return null;
     }
-  }, [products]);
-
-  // Marketplace & Chat
-  const getSupplierCatalog = useCallback(() => suppliers.flatMap(s => s.products), [suppliers]);
-
-  const placeRestockOrder = useCallback((supplierId: string, items: RestockOrderItem[]) => {
-    const order = createRestockOrder({ supplierId, items, suppliers });
-    if (!order) return null;
-    setRestockOrders(prev => [order, ...prev]);
-    const supplier = suppliers.find(s => s.id === supplierId);
-    if (supplier) {
-      const msgText = formatRestockMessage(order, supplier);
-      const chat = sendChatMessage({
-        senderId: "store-owner",
-        receiverId: supplierId,
-        message: msgText,
-        context: "restock",
-        threadId: order.id,
-      });
-      setChatMessages(prev => [chat, ...prev]);
+    const activeList = await loadActiveRestockList(currentStore.id, preferredListId);
+    if (!activeList) {
+      setActiveRestockListId(null);
+      setActiveRestockSupplierId(null);
+      setRestockList([]);
+      setRestockBudget(null);
+      return null;
     }
-    return order;
-  }, [suppliers]);
+    const budget = await persistCalculateRestockBudget(activeList.id).catch(() => null);
+    setActiveRestockListId(activeList.id);
+    setActiveRestockSupplierId(activeList.supplierId || null);
+    setRestockBudget(budget);
+    setRestockList(
+      activeList.items.map(item => {
+        const mapped = mapRestockDbItemToStoreItem(item);
+        const budgetItem = budget?.items.find(x => x.restockItemId === item.id);
+        return budgetItem
+          ? {
+              ...mapped,
+              estimatedUnitCost: budgetItem.estimatedUnitCost,
+              estimatedCost: budgetItem.estimatedItemTotal,
+              missingPrice: budgetItem.missingPrice,
+            }
+          : mapped;
+      })
+    );
+    return activeList;
+  }, [currentStore]);
 
-  const updateRestockOrderStatus = useCallback((orderId: string, status: RestockOrderStatus) => {
-    setRestockOrders(prev => prev.map(o => o.id === orderId ? applyRestockOrderStatus(o, status) : o));
-  }, []);
+  const loadSuppliers = useCallback(async () => {
+    if (!currentStore) {
+      setSuppliers([]);
+      return;
+    }
+    const rows = await loadSuppliersRecords(currentStore.id);
+    setSuppliers(rows.map(mapSupplierRecordToStoreSupplier));
+  }, [currentStore]);
 
-  const sendChat = useCallback((input: Omit<ChatMessage, "id" | "timestamp"> & { id?: string; timestamp?: string }) => {
-    const msg = sendChatMessage(input);
-    setChatMessages(prev => [msg, ...prev]);
-    return msg;
-  }, []);
+  const loadRestockHistory = useCallback(async () => {
+    if (!currentStore) {
+      setRestockHistory([]);
+      return;
+    }
+    const rows = await loadRestockHistoryRecords(currentStore.id);
+    setRestockHistory(rows.map(mapRestockHistoryRecord));
+  }, [currentStore]);
 
-  const getConversationMessages = useCallback((a: string, b: string) => {
-    return getConversation(a, b);
-  }, []);
+  const generateSmartRestockSuggestions = useCallback(async () => {
+    if (!currentStore) {
+      setSmartRestockSuggestions([]);
+      return [];
+    }
+    const suggestions = await persistGenerateSmartRestockSuggestions(currentStore.id);
+    setSmartRestockSuggestions(suggestions);
+    return suggestions;
+  }, [currentStore]);
+
+  const createRestockList = useCallback(async (supplierId?: string) => {
+    if (!currentStore) return;
+    const list = await persistCreateRestockList(currentStore.id, supplierId);
+    setActiveRestockListId(list.id);
+    setActiveRestockSupplierId(list.supplierId || null);
+    await refreshActiveRestock(list.id);
+  }, [currentStore, refreshActiveRestock]);
+
+  const addProductToRestockList = useCallback(async (productId: string, qty: number, unit?: string) => {
+    if (!currentStore) return;
+    let targetListId = activeRestockListId;
+    if (!targetListId) {
+      const created = await persistCreateRestockList(currentStore.id, activeRestockSupplierId || undefined);
+      targetListId = created.id;
+      setActiveRestockListId(created.id);
+      setActiveRestockSupplierId(created.supplierId || null);
+    }
+    const product = products.find(p => p.id === productId);
+    await persistAddProductToRestockList(targetListId, productId, qty, unit || product?.unit || "piece");
+    await refreshActiveRestock(targetListId);
+  }, [activeRestockListId, activeRestockSupplierId, currentStore, products, refreshActiveRestock]);
+
+  const updateRestockItem = useCallback(async (restockItemId: string, fields: Partial<RestockItem>) => {
+    const payload: Record<string, any> = {};
+    if (fields.suggestedQty !== undefined) payload.suggestedQty = fields.suggestedQty;
+    if (fields.editedQty !== undefined) payload.editedQty = fields.editedQty;
+    if (fields.purchasedQty !== undefined) payload.purchasedQty = fields.purchasedQty;
+    if (fields.unit !== undefined) payload.unit = fields.unit;
+    if (fields.estimatedUnitCost !== undefined) payload.estimatedUnitCost = fields.estimatedUnitCost;
+    if (fields.actualUnitCost !== undefined) payload.actualUnitCost = fields.actualUnitCost;
+    if (fields.checked !== undefined) payload.isChecked = fields.checked;
+    if (fields.status !== undefined) payload.status = fields.status;
+    await persistUpdateRestockItem(restockItemId, payload);
+    if (activeRestockListId) {
+      await refreshActiveRestock(activeRestockListId);
+    }
+  }, [activeRestockListId, refreshActiveRestock]);
+
+  const removeRestockItem = useCallback(async (restockItemId: string) => {
+    await persistRemoveRestockItem(restockItemId);
+    if (activeRestockListId) {
+      await refreshActiveRestock(activeRestockListId);
+    }
+  }, [activeRestockListId, refreshActiveRestock]);
+
+  const assignSupplierToRestockList = useCallback(async (supplierId: string) => {
+    if (!activeRestockListId) return;
+    await persistAssignSupplierToRestockList(activeRestockListId, supplierId);
+    await refreshActiveRestock(activeRestockListId);
+  }, [activeRestockListId, refreshActiveRestock]);
+
+  const calculateRestockBudget = useCallback(async () => {
+    if (!currentStore || !activeRestockListId) {
+      setRestockBudget(null);
+      return null;
+    }
+    const stillActive = await loadActiveRestockList(currentStore.id, activeRestockListId);
+    if (!stillActive) {
+      setActiveRestockListId(null);
+      setActiveRestockSupplierId(null);
+      setRestockList([]);
+      setRestockBudget(null);
+      return null;
+    }
+    const budget = await persistCalculateRestockBudget(activeRestockListId);
+    setRestockBudget(budget);
+    setRestockList(prev => prev.map(item => {
+      const entry = budget.items.find(x => x.restockItemId === item.id);
+      return entry
+        ? {
+            ...item,
+            estimatedUnitCost: entry.estimatedUnitCost,
+            estimatedCost: entry.estimatedItemTotal,
+            missingPrice: entry.missingPrice,
+          }
+        : item;
+    }));
+    return budget;
+  }, [activeRestockListId, currentStore]);
+
+  const confirmRestock = useCallback(async (actualCostsByItem: ConfirmRestockInput) => {
+    if (!activeRestockListId || !currentStore) return false;
+    try {
+      await persistConfirmRestockList(activeRestockListId, actualCostsByItem);
+      const [dbProducts, historyRows] = await Promise.all([
+        loadProducts(),
+        loadRestockHistoryRecords(currentStore.id),
+      ]);
+      setProducts(dbProducts);
+      setRestockHistory(historyRows.map(mapRestockHistoryRecord));
+      await refreshActiveRestock();
+      await syncAll().catch(() => {});
+      return true;
+    } catch (err) {
+      console.error("Confirm restock failed", err);
+      return false;
+    }
+  }, [activeRestockListId, currentStore, refreshActiveRestock]);
+
+  const createSupplier = useCallback(async (payload: { name: string; location?: string; contactNumber?: string; notes?: string }) => {
+    if (!currentStore || !payload.name.trim()) return;
+    await persistCreateSupplier({
+      storeId: currentStore.id,
+      name: payload.name.trim(),
+      location: payload.location,
+      contactNumber: payload.contactNumber,
+      notes: payload.notes,
+    });
+    await loadSuppliers();
+  }, [currentStore, loadSuppliers]);
+
+  useEffect(() => {
+    if (!currentStore) return;
+    void loadSuppliers();
+    void loadRestockHistory();
+    void refreshActiveRestock();
+  }, [currentStore, loadSuppliers, loadRestockHistory, refreshActiveRestock]);
 
   // Expenses
   const addExpense = useCallback((e: Omit<Expense, "id">) => {
@@ -1996,8 +2252,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [sales, products, expenses]);
 
   const getSmartRestockSuggestions = useCallback(() => {
-    return generateRestockSuggestions(products, sales, { lookbackDays: 7, bufferDays: 14, thresholdDays: 3 });
-  }, [products, sales]);
+    return smartRestockSuggestions;
+  }, [smartRestockSuggestions]);
 
   const getProductAnalytics = useCallback((period: "today" | "week" | "all") => {
     const cutoff = period === "today"
@@ -2062,7 +2318,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <StoreContext.Provider value={{
-      products, cart, customers, sales, pabiliOrders, expenses, restockList, suppliers, restockOrders, chatMessages, settings, t,
+      products, cart, customers, sales, pabiliOrders, expenses,
+      restockList, activeRestockListId, activeRestockSupplierId, smartRestockSuggestions,
+      suppliers, restockHistory, restockBudget,
+      settings, t,
       currentAccount, currentStore, session, managementUnlocked, isHydrated,
       createAccount, login, logout, verifyManagementPin, verifyManagementPinForAction, createManagementPin,
       isManagementMode, operatingUser,
@@ -2072,8 +2331,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       completeSale, addUtangSale,
       addCustomer, updateCustomerProfile, recordPayment, getCustomerBalance, getCustomerCreditStatus,
       addPabiliOrder, updatePabiliStatus,
-      updateRestockList, checkRestockItem, placeRestockOrder, updateRestockOrderStatus, getSupplierCatalog,
-      sendChat, getConversation: getConversationMessages,
+      generateSmartRestockSuggestions, createRestockList,
+      addProductToRestockList, updateRestockItem, removeRestockItem, assignSupplierToRestockList,
+      calculateRestockBudget, confirmRestock, loadRestockHistory, loadSuppliers, createSupplier,
       addExpense,
       getWeeklyRevenue, getWeeklyProfit,
       getSmartRestockSuggestions, getProductAnalytics,

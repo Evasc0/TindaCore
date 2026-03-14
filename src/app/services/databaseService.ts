@@ -30,7 +30,12 @@ export type Table =
   | "utang_payments"
   | "customer_payment_history"
   | "pabili_orders"
-  | "expenses";
+  | "expenses"
+  | "restock_lists"
+  | "restock_items"
+  | "suppliers"
+  | "supplier_prices"
+  | "restock_history";
 
 export interface DataScope {
   accountId: string;
@@ -38,6 +43,14 @@ export interface DataScope {
 }
 
 let currentScope: DataScope | null = null;
+
+const tablesWithSyncStatus = new Set<Table>([
+  "restock_lists",
+  "restock_items",
+  "suppliers",
+  "supplier_prices",
+  "restock_history",
+]);
 
 const now = () => Date.now();
 const generateId = () => Number(`${Date.now()}${Math.floor(Math.random() * 1000)}`);
@@ -1149,8 +1162,11 @@ export async function getDirtyRows(table: Table) {
   const scope = currentScope;
   if (!scope) return [];
   const filter = scopeFilterForTable(table, scope);
+  const pendingClause = tablesWithSyncStatus.has(table)
+    ? "(is_dirty = 1 OR COALESCE(sync_status, 'pending') != 'synced')"
+    : "is_dirty = 1";
   return queryAll<any>(
-    `SELECT * FROM ${table} WHERE is_dirty = 1 AND ${filter.clause}`,
+    `SELECT * FROM ${table} WHERE ${pendingClause} AND ${filter.clause}`,
     filter.params
   );
 }
@@ -1165,8 +1181,11 @@ export async function markSynced(table: Table, ids: string[]) {
     return acc;
   }, {});
   const filter = scopeFilterForTable(table, scope);
+  const syncSetClause = tablesWithSyncStatus.has(table)
+    ? "is_dirty = 0, sync_status = 'synced'"
+    : "is_dirty = 0";
   await run(
-    `UPDATE ${table} SET is_dirty = 0 WHERE id IN (${placeholders}) AND ${filter.clause}`,
+    `UPDATE ${table} SET ${syncSetClause} WHERE id IN (${placeholders}) AND ${filter.clause}`,
     { ...idParams, ...filter.params }
   );
 }
@@ -1175,7 +1194,13 @@ export async function upsertRemote(table: Table, rows: any[]) {
   await getDb();
   const scope = currentScope;
   if (!scope || !rows.length) return;
-  const scopedRows = rows.filter(row => rowMatchesScope(table, row, scope));
+  const scopedRows = rows
+    .filter(row => rowMatchesScope(table, row, scope))
+    .map(row =>
+      tablesWithSyncStatus.has(table)
+        ? { ...row, sync_status: row.sync_status || "synced", is_dirty: 0 }
+        : row
+    );
   if (!scopedRows.length) return;
   await runTransaction(db => {
     scopedRows.forEach(row => {

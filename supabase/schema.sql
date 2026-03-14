@@ -249,6 +249,109 @@ create table if not exists expenses (
 create index if not exists expenses_scope_idx on expenses (account_id, store_id);
 create index if not exists expenses_updated_at_idx on expenses (updated_at);
 
+-- Restock lists
+create table if not exists restock_lists (
+  id text primary key,
+  account_id text not null references accounts(id) on delete cascade,
+  store_id text not null references stores(id) on delete cascade,
+  supplier_id text,
+  status text not null,
+  created_at text not null,
+  updated_at bigint default floor(extract(epoch from now()) * 1000),
+  estimated_total numeric default 0,
+  confirmed_total numeric default 0,
+  sync_status text default 'pending',
+  is_dirty boolean default false,
+  deleted boolean default false
+);
+create index if not exists restock_lists_scope_idx on restock_lists (account_id, store_id);
+create index if not exists restock_lists_updated_at_idx on restock_lists (updated_at);
+
+-- Restock items
+create table if not exists restock_items (
+  id text primary key,
+  restock_list_id text not null references restock_lists(id) on delete cascade,
+  account_id text not null references accounts(id) on delete cascade,
+  store_id text not null references stores(id) on delete cascade,
+  product_id text not null,
+  suggested_qty numeric default 0,
+  edited_qty numeric default 0,
+  purchased_qty numeric default 0,
+  unit text not null,
+  estimated_unit_cost numeric default 0,
+  actual_unit_cost numeric default 0,
+  is_checked boolean default false,
+  status text default 'draft',
+  created_at text not null,
+  updated_at bigint default floor(extract(epoch from now()) * 1000),
+  sync_status text default 'pending',
+  is_dirty boolean default false,
+  deleted boolean default false
+);
+create index if not exists restock_items_scope_idx on restock_items (account_id, store_id);
+create index if not exists restock_items_list_idx on restock_items (restock_list_id);
+create index if not exists restock_items_updated_at_idx on restock_items (updated_at);
+
+-- Suppliers
+create table if not exists suppliers (
+  id text primary key,
+  account_id text not null references accounts(id) on delete cascade,
+  store_id text not null references stores(id) on delete cascade,
+  name text not null,
+  location text,
+  contact_number text,
+  notes text,
+  created_at text not null,
+  updated_at bigint default floor(extract(epoch from now()) * 1000),
+  sync_status text default 'pending',
+  is_dirty boolean default false,
+  deleted boolean default false
+);
+create index if not exists suppliers_scope_idx on suppliers (account_id, store_id);
+create index if not exists suppliers_updated_at_idx on suppliers (updated_at);
+
+-- Supplier prices
+create table if not exists supplier_prices (
+  id text primary key,
+  supplier_id text not null references suppliers(id) on delete cascade,
+  product_id text not null,
+  account_id text not null references accounts(id) on delete cascade,
+  store_id text not null references stores(id) on delete cascade,
+  unit text not null,
+  price numeric not null,
+  created_at text not null,
+  updated_at bigint default floor(extract(epoch from now()) * 1000),
+  sync_status text default 'pending',
+  is_dirty boolean default false,
+  deleted boolean default false
+);
+create index if not exists supplier_prices_scope_idx on supplier_prices (account_id, store_id);
+create index if not exists supplier_prices_supplier_idx on supplier_prices (supplier_id);
+create index if not exists supplier_prices_updated_at_idx on supplier_prices (updated_at);
+create unique index if not exists supplier_prices_unique_idx on supplier_prices (supplier_id, product_id, unit, account_id, store_id);
+
+-- Restock history
+create table if not exists restock_history (
+  id text primary key,
+  account_id text not null references accounts(id) on delete cascade,
+  store_id text not null references stores(id) on delete cascade,
+  product_id text not null,
+  supplier_id text references suppliers(id) on delete set null,
+  quantity numeric not null,
+  unit text not null,
+  unit_cost numeric not null,
+  total_cost numeric not null,
+  restock_list_id text references restock_lists(id) on delete set null,
+  created_at text not null,
+  updated_at bigint default floor(extract(epoch from now()) * 1000),
+  sync_status text default 'pending',
+  is_dirty boolean default false,
+  deleted boolean default false
+);
+create index if not exists restock_history_scope_idx on restock_history (account_id, store_id);
+create index if not exists restock_history_product_idx on restock_history (product_id);
+create index if not exists restock_history_updated_at_idx on restock_history (updated_at);
+
 -- Optional: disable RLS for local/offline style anon usage.
 alter table accounts disable row level security;
 alter table stores disable row level security;
@@ -264,3 +367,8 @@ alter table utang_payments disable row level security;
 alter table customer_payment_history disable row level security;
 alter table pabili_orders disable row level security;
 alter table expenses disable row level security;
+alter table restock_lists disable row level security;
+alter table restock_items disable row level security;
+alter table suppliers disable row level security;
+alter table supplier_prices disable row level security;
+alter table restock_history disable row level security;

@@ -23,6 +23,11 @@ const defaultTables: Table[] = [
   "customer_payment_history",
   "pabili_orders",
   "expenses",
+  "restock_lists",
+  "restock_items",
+  "suppliers",
+  "supplier_prices",
+  "restock_history",
 ];
 
 const isOnline = () => (typeof navigator !== "undefined" ? navigator.onLine : true);
@@ -98,6 +103,8 @@ export const syncCustomers = () => syncTables(["customers", "customer_payment_hi
 export const syncUtang = () => syncTables(["utang_records", "utang_payments", "customer_payment_history"]);
 export const syncExpenses = () => syncTables(["expenses"]);
 export const syncPabili = () => syncTables(["pabili_orders"]);
+export const syncRestock = () =>
+  syncTables(["restock_lists", "restock_items", "suppliers", "supplier_prices", "restock_history"]);
 
 export async function syncAll() {
   if (!isSupabaseConfigured) return { skipped: true };

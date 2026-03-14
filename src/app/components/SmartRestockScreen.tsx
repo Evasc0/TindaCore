@@ -1,14 +1,33 @@
-import React, { useState, useEffect } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router";
-import { RefreshCw, Check, Share2, ArrowLeft, Package, ShoppingCart, AlertTriangle, Download, MessageSquare, Printer } from "lucide-react";
-import { useStore, canAccess, RestockItem, Product } from "../context/StoreContext";
+import { ArrowLeft, Package, ShoppingCart, Check, AlertTriangle, Plus, Trash2 } from "lucide-react";
+import { useStore, canAccess } from "../context/StoreContext";
 import { TierBadge, TierGate, UpgradeBanner } from "./TierComponents";
+
+type ConfirmDraft = { purchasedQty: number; actualUnitCost: number };
 
 export function SmartRestockScreen() {
   const {
-    settings, t, getSmartRestockSuggestions, restockList,
-    updateRestockList, checkRestockItem, products,
-    suppliers, placeRestockOrder, restockOrders,
+    settings,
+    t,
+    products,
+    smartRestockSuggestions,
+    getSmartRestockSuggestions,
+    generateSmartRestockSuggestions,
+    createRestockList,
+    activeRestockListId,
+    activeRestockSupplierId,
+    restockList,
+    addProductToRestockList,
+    updateRestockItem,
+    removeRestockItem,
+    suppliers,
+    loadSuppliers,
+    createSupplier,
+    assignSupplierToRestockList,
+    restockBudget,
+    calculateRestockBudget,
+    confirmRestock,
   } = useStore();
   const navigate = useNavigate();
   const isDark = settings.theme === "dark";
@@ -20,98 +39,160 @@ export function SmartRestockScreen() {
   const text = isDark ? "#f9fafb" : "#111827";
   const textMuted = isDark ? "#9ca3af" : "#6b7280";
 
-  const getSellingStock = (p: Product) => {
-    const factor =
-      p.unit === "pack" || p.unit === "box"
-        ? p.conversion || 1
-        : p.unit === "kg" || p.unit === "liters"
-        ? 1000
-        : 1;
-    const qty = (p.stock || 0) / factor;
-    return p.unit === "kg" || p.unit === "liters" ? parseFloat(qty.toFixed(2)) : Math.floor(qty);
-  };
-
-  const suggestions = getSmartRestockSuggestions();
-  const shownSuggestions = canAccess(sub, "premium") ? suggestions : [];
-
-  const [editedQtys, setEditedQtys] = useState<Record<string, number>>(() =>
-    Object.fromEntries(suggestions.map(s => [s.product.id, s.suggestedQty]))
-  );
-  const [shoppingList, setShoppingList] = useState<RestockItem[]>(restockList);
   const [tab, setTab] = useState<"suggestions" | "list">("suggestions");
-  const [lastOrderId, setLastOrderId] = useState<string | null>(null);
+  const [editedSuggestionQtys, setEditedSuggestionQtys] = useState<Record<string, number>>({});
+  const [confirmDrafts, setConfirmDrafts] = useState<Record<string, ConfirmDraft>>({});
+  const [isReviewingCheckedItems, setIsReviewingCheckedItems] = useState(false);
+  const [isConfirmCardZoomed, setIsConfirmCardZoomed] = useState(false);
+  const [isConfirming, setIsConfirming] = useState(false);
+  const [confirmMessage, setConfirmMessage] = useState<string | null>(null);
+  const [manualProductId, setManualProductId] = useState("");
+  const [manualQty, setManualQty] = useState(1);
+  const [supplierName, setSupplierName] = useState("");
+  const [supplierLocation, setSupplierLocation] = useState("");
+  const [supplierContact, setSupplierContact] = useState("");
 
-  const totalBudget = shoppingList.filter(i => !i.checked).reduce((sum, i) => sum + i.estimatedCost, 0);
-  const recentOrder = lastOrderId ? restockOrders.find(o => o.id === lastOrderId) : restockOrders[0];
+  const suggestions = smartRestockSuggestions.length ? smartRestockSuggestions : getSmartRestockSuggestions();
 
-  const addToShoppingList = (s: (typeof suggestions)[0]) => {
-    const qty = editedQtys[s.product.id] || s.suggestedQty;
-    const existing = shoppingList.find(i => i.productId === s.product.id);
-    if (existing) return;
-    const newItem: RestockItem = {
-      productId: s.product.id,
-      productName: s.product.name,
-      emoji: s.product.emoji,
-      suggestedQty: s.suggestedQty,
-      editedQty: qty,
-      estimatedCost: qty * s.product.cost,
-      checked: false,
-    };
-    const updated = [...shoppingList, newItem];
-    setShoppingList(updated);
-    updateRestockList(updated);
-  };
+  useEffect(() => {
+    void generateSmartRestockSuggestions();
+    void loadSuppliers();
+  }, [generateSmartRestockSuggestions, loadSuppliers]);
 
-  const toggleCheck = (productId: string) => {
-    const item = shoppingList.find(i => i.productId === productId);
-    if (!item) return;
-    const newChecked = !item.checked;
-    const updated = shoppingList.map(i => i.productId === productId ? { ...i, checked: newChecked } : i);
-    setShoppingList(updated);
-    if (newChecked) {
-      checkRestockItem(productId, true, item.editedQty);
-    }
-    updateRestockList(updated);
-  };
+  useEffect(() => {
+    if (!activeRestockListId) return;
+    void calculateRestockBudget();
+  }, [activeRestockListId, calculateRestockBudget]);
 
-  const updateQty = (productId: string, qty: number) => {
-    const updated = shoppingList.map(i => {
-      if (i.productId === productId) {
-        const p = products.find(x => x.id === productId);
-        return { ...i, editedQty: qty, estimatedCost: qty * (p?.cost || 0) };
-      }
-      return i;
+  useEffect(() => {
+    setEditedSuggestionQtys(prev => {
+      const next = { ...prev };
+      suggestions.forEach(item => {
+        if (!next[item.productId]) {
+          next[item.productId] = item.suggestedQty;
+        }
+      });
+      return next;
     });
-    setShoppingList(updated);
-    updateRestockList(updated);
+  }, [suggestions]);
+
+  useEffect(() => {
+    setConfirmDrafts(prev => {
+      const next = { ...prev };
+      restockList.forEach(item => {
+        if (!next[item.id]) {
+          next[item.id] = {
+            purchasedQty: item.purchasedQty > 0 ? item.purchasedQty : Math.max(1, item.editedQty),
+            actualUnitCost: item.actualUnitCost > 0 ? item.actualUnitCost : Math.max(0, item.estimatedUnitCost),
+          };
+        }
+      });
+      return next;
+    });
+  }, [restockList]);
+
+  const estimatedTotal = restockBudget?.estimatedTotal
+    ?? restockList.reduce((sum, item) => sum + item.estimatedCost, 0);
+  const missingPriceCount = restockBudget?.missingPriceCount
+    ?? restockList.filter(item => item.estimatedUnitCost <= 0).length;
+  const checkedItems = restockList.filter(item => item.checked);
+  const isConfirmSuccess = (confirmMessage || "").startsWith("Restock confirmed");
+  const confirmationStep = isConfirmSuccess ? 3 : isReviewingCheckedItems ? 2 : 1;
+
+  const manualProduct = useMemo(
+    () => products.find(p => p.id === manualProductId),
+    [manualProductId, products]
+  );
+
+  const ensureRestockList = async () => {
+    if (!activeRestockListId) {
+      await createRestockList(activeRestockSupplierId || undefined);
+    }
   };
 
-  const handleSendOrder = () => {
-    const supplier = suppliers[0];
-    if (!supplier || shoppingList.length === 0) return;
-    const items = shoppingList.map(item => {
-      const product = products.find(p => p.id === item.productId);
-      return {
-        productId: item.productId,
-        name: item.productName,
-        quantity: item.editedQty || item.suggestedQty,
-        unit: product?.unit || "piece",
-        price: product?.cost || 0,
+  const handleAddSuggestion = async (productId: string, fallbackUnit: string) => {
+    const qty = Math.max(1, editedSuggestionQtys[productId] || 1);
+    await ensureRestockList();
+    await addProductToRestockList(productId, qty, fallbackUnit);
+    await calculateRestockBudget();
+  };
+
+  const handleToggleChecked = async (restockItemId: string, checked: boolean, editedQty: number) => {
+    setIsReviewingCheckedItems(false);
+    await updateRestockItem(restockItemId, {
+      checked,
+      purchasedQty: checked ? Math.max(1, editedQty) : 0,
+    });
+  };
+
+  const buildConfirmPayload = () => {
+    const payload: Record<string, { actualUnitCost: number; purchasedQty: number }> = {};
+    checkedItems.forEach(item => {
+      const draft = confirmDrafts[item.id] || { purchasedQty: item.editedQty, actualUnitCost: item.estimatedUnitCost };
+      payload[item.id] = {
+        purchasedQty: Math.max(0, Number(draft.purchasedQty || 0)),
+        actualUnitCost: Math.max(0, Number(draft.actualUnitCost || 0)),
       };
     });
-    const order = placeRestockOrder(supplier.id, items);
-    if (order) {
-      setLastOrderId(order.id);
+    return payload;
+  };
+
+  const hasValidConfirmPayload = (payload: Record<string, { actualUnitCost: number; purchasedQty: number }>) =>
+    checkedItems.every(item => {
+      const data = payload[item.id];
+      return data && data.purchasedQty > 0 && data.actualUnitCost > 0;
+    });
+
+  const handleReviewCheckedItems = () => {
+    if (checkedItems.length === 0) {
+      setConfirmMessage("Please check purchased items before confirming.");
+      return;
+    }
+    const payload = buildConfirmPayload();
+    if (!hasValidConfirmPayload(payload)) {
+      setConfirmMessage("Each checked item needs purchased qty > 0 and actual unit cost.");
+      return;
+    }
+    setConfirmMessage(null);
+    setIsReviewingCheckedItems(true);
+  };
+
+  const handleConfirmRestock = async () => {
+    const payload = buildConfirmPayload();
+    if (!hasValidConfirmPayload(payload)) {
+      setConfirmMessage("Each checked item needs purchased qty > 0 and actual unit cost.");
+      setIsReviewingCheckedItems(false);
+      return;
+    }
+    setIsConfirming(true);
+    setConfirmMessage(null);
+    const ok = await confirmRestock(payload);
+    setIsConfirming(false);
+    if (ok) {
+      await generateSmartRestockSuggestions();
+      setConfirmDrafts({});
+      setIsReviewingCheckedItems(false);
+      setTab("suggestions");
+      setConfirmMessage("Restock confirmed. Inventory updated and shopping list reset.");
+    } else {
+      setConfirmMessage("Restock confirmation failed. Please try again.");
     }
   };
 
-  const getStockBadge = (stock: number, avgDaily: number) => {
-    const daysLeft = avgDaily > 0 ? stock / avgDaily : Infinity;
-    if (stock === 0) return { label: "OUT", bg: isDark ? "#450a0a" : "#fef2f2", color: "#ef4444" };
-    if (daysLeft < 3) return { label: "CRITICAL", bg: isDark ? "#450a0a" : "#fef2f2", color: "#ef4444" };
-    if (daysLeft < 7) return { label: "LOW", bg: isDark ? "#431407" : "#fff7ed", color: "#f97316" };
-    return { label: "OK", bg: isDark ? "#14532d" : "#f0fdf4", color: "#16a34a" };
-  };
+  const reviewPayload = buildConfirmPayload();
+  const reviewTotal = checkedItems.reduce((sum, item) => {
+    const data = reviewPayload[item.id];
+    if (!data) return sum;
+    return sum + (data.purchasedQty * data.actualUnitCost);
+  }, 0);
+
+  useEffect(() => {
+    if (tab !== "list") return;
+    if (!checkedItems.length && !isConfirmSuccess) return;
+    setIsConfirmCardZoomed(true);
+    const timer = window.setTimeout(() => setIsConfirmCardZoomed(false), 260);
+    return () => window.clearTimeout(timer);
+  }, [tab, checkedItems.length, isReviewingCheckedItems, isConfirming, isConfirmSuccess]);
 
   if (!canAccess(sub, "premium")) {
     return (
@@ -134,7 +215,6 @@ export function SmartRestockScreen() {
 
   return (
     <div className="flex flex-col h-full" style={{ background: bg }}>
-      {/* Header */}
       <div style={{ background: "linear-gradient(160deg, #14532d 0%, #166534 60%, #16a34a 100%)" }} className="px-4 pt-4 pb-5 flex-shrink-0">
         <div className="flex items-center gap-3 mb-3">
           <button onClick={() => navigate("/management/dashboard")} className="w-9 h-9 rounded-full flex items-center justify-center" style={{ background: "rgba(255,255,255,0.2)" }}>
@@ -150,8 +230,8 @@ export function SmartRestockScreen() {
         <div className="flex gap-2">
           {[
             { label: "Need Restock", value: suggestions.length, color: "text-red-200" },
-            { label: "In Shopping List", value: shoppingList.length, color: "text-yellow-200" },
-            { label: "Est. Budget", value: `₱${totalBudget.toFixed(0)}`, color: "text-white" },
+            { label: "In Restock List", value: restockList.length, color: "text-yellow-200" },
+            { label: "Est. Budget", value: `₱${estimatedTotal.toFixed(0)}`, color: "text-white" },
           ].map(({ label, value, color }) => (
             <div key={label} className="flex-1 rounded-xl px-2 py-2 text-center" style={{ background: "rgba(255,255,255,0.15)" }}>
               <p className={`font-bold ${color} text-sm`}>{value}</p>
@@ -160,7 +240,6 @@ export function SmartRestockScreen() {
           ))}
         </div>
 
-        {/* Tabs */}
         <div className="flex gap-1 mt-3 rounded-xl overflow-hidden p-1" style={{ background: "rgba(0,0,0,0.2)" }}>
           {(["suggestions", "list"] as const).map(tabKey => (
             <button
@@ -172,245 +251,357 @@ export function SmartRestockScreen() {
                 color: tab === tabKey ? "#166534" : "#86efac",
               }}
             >
-              {tabKey === "suggestions" ? `${t.suggestedRestock} (${shownSuggestions.length})` : `${t.restockList} (${shoppingList.length})`}
+              {tabKey === "suggestions"
+                ? `${t.suggestedRestock} (${suggestions.length})`
+                : `${t.restockList} (${restockList.length})`}
             </button>
           ))}
         </div>
       </div>
 
-      {/* ── Suggestions Tab ── */}
       {tab === "suggestions" && (
         <div className="flex-1 overflow-y-auto px-4 py-3" style={{ scrollbarWidth: "none" }}>
-          {shownSuggestions.length === 0 ? (
+          {suggestions.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-16" style={{ color: textMuted }}>
               <Package size={40} style={{ marginBottom: "12px", opacity: 0.4 }} />
               <p className="text-sm font-medium">{t.noRestockNeeded}</p>
             </div>
           ) : (
-            <>
-              <p className="text-xs mb-3" style={{ color: textMuted }}>{t.restockDescription}</p>
-              {shownSuggestions.map(s => {
-                const badge = getStockBadge(getSellingStock(s.product), s.avgDailySales);
-                const isInList = shoppingList.some(i => i.productId === s.product.id);
-                return (
-                  <div key={s.product.id} className="rounded-2xl border mb-3 overflow-hidden" style={{ background: card, borderColor: cardBorder }}>
-                    <div className="px-4 py-3">
-                      <div className="flex items-center justify-between mb-2">
-                        <div className="flex items-center gap-3">
-                          <span className="text-2xl">{s.product.emoji}</span>
-                          <div>
-                            <p className="font-semibold text-sm" style={{ color: text }}>{s.product.name}</p>
-                            <p className="text-xs" style={{ color: textMuted }}>{s.product.category}</p>
-                          </div>
-                        </div>
-                        <span className="text-xs font-bold px-2 py-1 rounded-full" style={{ background: badge.bg, color: badge.color }}>
-                          {badge.label}
-                        </span>
-                      </div>
-
-                      {/* Stats row */}
-                      <div className="grid grid-cols-3 gap-2 my-3">
-                        {[
-                          { label: "Current Stock", value: `${getSellingStock(s.product)}`, accent: badge.color },
-                          { label: t.avgDailySales, value: `${s.avgDailySales.toFixed(1)}/day`, accent: text },
-                          { label: t.suggestedQty, value: `${editedQtys[s.product.id] || s.suggestedQty}`, accent: "#2563eb" },
-                        ].map(({ label, value, accent }) => (
-                          <div key={label} className="text-center rounded-xl py-2" style={{ background: isDark ? "#374151" : "#f9fafb" }}>
-                            <p className="font-bold text-sm" style={{ color: accent }}>{value}</p>
-                            <p style={{ fontSize: "9px", color: textMuted }}>{label}</p>
-                          </div>
-                        ))}
-                      </div>
-
-                      {/* Edit qty */}
-                      <div className="flex items-center justify-between mb-3">
-                        <p className="text-xs" style={{ color: textMuted }}>
-                          {t.estimatedCost}: <span style={{ color: text, fontWeight: 700 }}>₱{((editedQtys[s.product.id] || s.suggestedQty) * s.product.cost).toFixed(2)}</span>
-                        </p>
-                        <div className="flex items-center gap-2">
-                          <button
-                            onClick={() => setEditedQtys(prev => ({ ...prev, [s.product.id]: Math.max(1, (prev[s.product.id] || s.suggestedQty) - 1) }))}
-                            className="w-7 h-7 rounded-lg flex items-center justify-center"
-                            style={{ background: isDark ? "#374151" : "#f3f4f6" }}
-                          >
-                            <span style={{ color: textMuted, fontWeight: 700, fontSize: "14px" }}>−</span>
-                          </button>
-                          <input
-                            type="number"
-                            value={editedQtys[s.product.id] || s.suggestedQty}
-                            onChange={e => setEditedQtys(prev => ({ ...prev, [s.product.id]: parseInt(e.target.value) || 1 }))}
-                            className="w-12 text-center outline-none rounded-lg py-1 text-sm font-bold border"
-                            style={{ background: isDark ? "#374151" : "#f3f4f6", color: text, borderColor: cardBorder }}
-                          />
-                          <button
-                            onClick={() => setEditedQtys(prev => ({ ...prev, [s.product.id]: (prev[s.product.id] || s.suggestedQty) + 1 }))}
-                            className="w-7 h-7 rounded-lg flex items-center justify-center"
-                            style={{ background: "#2563eb" }}
-                          >
-                            <span className="text-white font-bold" style={{ fontSize: "14px" }}>+</span>
-                          </button>
+            suggestions.map(s => {
+              const inList = restockList.some(item => item.productId === s.productId);
+              const qty = Math.max(1, editedSuggestionQtys[s.productId] || s.suggestedQty);
+              return (
+                <div key={s.productId} className="rounded-2xl border mb-3 overflow-hidden" style={{ background: card, borderColor: cardBorder }}>
+                  <div className="px-4 py-3">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-3">
+                        <span className="text-2xl">{s.product.emoji}</span>
+                        <div>
+                          <p className="font-semibold text-sm" style={{ color: text }}>{s.product.name}</p>
+                          <p className="text-xs" style={{ color: textMuted }}>{s.product.category}</p>
                         </div>
                       </div>
-
-                      {/* Add to list button */}
-                      {canAccess(sub, "premium") ? (
-                        <button
-                          onClick={() => !isInList && addToShoppingList(s)}
-                          className="w-full py-2.5 rounded-xl text-sm font-bold transition-all"
-                          style={{
-                            background: isInList ? (isDark ? "#374151" : "#f3f4f6") : "linear-gradient(135deg, #16a34a, #15803d)",
-                            color: isInList ? textMuted : "#fff",
-                            boxShadow: isInList ? "none" : "0 4px 12px rgba(22,163,74,0.3)",
-                          }}
-                        >
-                          {isInList ? "✓ Added to Shopping List" : `+ ${t.addToList}`}
-                        </button>
-                      ) : (
-                        <TierGate required="premium" featureName="Restock Shopping List" compact />
-                      )}
+                      <span className="text-xs font-bold px-2 py-1 rounded-full" style={{ background: isDark ? "#111827" : "#eff6ff", color: "#1d4ed8" }}>
+                        {s.unit}
+                      </span>
                     </div>
+                    <div className="grid grid-cols-3 gap-2 my-3">
+                      <div className="text-center rounded-xl py-2" style={{ background: isDark ? "#374151" : "#f9fafb" }}>
+                        <p className="font-bold text-sm" style={{ color: text }}>{s.currentStock}</p>
+                        <p style={{ fontSize: "9px", color: textMuted }}>Current Stock</p>
+                      </div>
+                      <div className="text-center rounded-xl py-2" style={{ background: isDark ? "#374151" : "#f9fafb" }}>
+                        <p className="font-bold text-sm" style={{ color: text }}>{s.avgDailySales.toFixed(1)}/day</p>
+                        <p style={{ fontSize: "9px", color: textMuted }}>{t.avgDailySales}</p>
+                      </div>
+                      <div className="text-center rounded-xl py-2" style={{ background: isDark ? "#374151" : "#f9fafb" }}>
+                        <p className="font-bold text-sm" style={{ color: "#2563eb" }}>{qty}</p>
+                        <p style={{ fontSize: "9px", color: textMuted }}>{t.suggestedQty}</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 mb-3">
+                      <input
+                        type="number"
+                        min={1}
+                        value={qty}
+                        onChange={e => setEditedSuggestionQtys(prev => ({ ...prev, [s.productId]: Math.max(1, Number(e.target.value || 1)) }))}
+                        className="w-20 text-center outline-none rounded-lg py-1 text-sm font-bold border"
+                        style={{ background: isDark ? "#374151" : "#f3f4f6", color: text, borderColor: cardBorder }}
+                      />
+                      <span className="text-xs" style={{ color: textMuted }}>Est. Cost: ₱{(qty * (s.product.cost || 0)).toFixed(2)}</span>
+                    </div>
+                    <button
+                      onClick={() => void handleAddSuggestion(s.productId, s.unit)}
+                      className="w-full py-2.5 rounded-xl text-sm font-bold transition-all"
+                      style={{
+                        background: inList ? (isDark ? "#374151" : "#f3f4f6") : "linear-gradient(135deg, #16a34a, #15803d)",
+                        color: inList ? textMuted : "#fff",
+                      }}
+                    >
+                      {inList ? "Added to Restock List" : `+ ${t.addToList}`}
+                    </button>
                   </div>
-                );
-              })}
-
-              {!canAccess(sub, "premium") && (
-                <div className="mt-2 mb-4">
-                  <UpgradeBanner from="plus" to="premium" />
                 </div>
-              )}
-            </>
+              );
+            })
           )}
         </div>
       )}
 
-      {/* ── Shopping List Tab ── */}
       {tab === "list" && (
         <div className="flex-1 overflow-y-auto px-4 py-3" style={{ scrollbarWidth: "none" }}>
-          {!canAccess(sub, "premium") ? (
-            <div className="mt-4">
-              <TierGate required="premium" featureName={t.restockList} />
+          {confirmMessage && (
+            <div
+              className="rounded-2xl border p-3 mb-3"
+              style={{
+                background: confirmMessage.startsWith("Restock confirmed")
+                  ? (isDark ? "#14532d" : "#f0fdf4")
+                  : (isDark ? "#450a0a" : "#fef2f2"),
+                borderColor: confirmMessage.startsWith("Restock confirmed")
+                  ? (isDark ? "#166534" : "#86efac")
+                  : (isDark ? "#7f1d1d" : "#fecaca"),
+              }}
+            >
+              <p className="text-xs font-semibold" style={{ color: confirmMessage.startsWith("Restock confirmed") ? "#16a34a" : "#ef4444" }}>
+                {confirmMessage}
+              </p>
             </div>
-          ) : shoppingList.length === 0 ? (
+          )}
+          {restockList.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-16" style={{ color: textMuted }}>
               <ShoppingCart size={40} style={{ marginBottom: "12px", opacity: 0.4 }} />
-              <p className="text-sm font-medium">Shopping list is empty</p>
+              <p className="text-sm font-medium">Restock list is empty</p>
               <p className="text-xs mt-1">Add items from Suggestions tab</p>
             </div>
           ) : (
             <>
-              <div className="rounded-2xl border mb-4" style={{ background: isDark ? "#14532d" : "#f0fdf4", borderColor: isDark ? "#166534" : "#bbf7d0" }}>
-                <div className="px-4 py-3">
-                  <p className="text-xs font-semibold" style={{ color: isDark ? "#86efac" : "#15803d" }}>{t.updateStockOnCheck}</p>
-                </div>
-              </div>
-
-              {shoppingList.map(item => (
-                <div
-                  key={item.productId}
-                  className="rounded-2xl border mb-3 overflow-hidden transition-all"
-                  style={{
-                    background: item.checked ? (isDark ? "#14532d" : "#f0fdf4") : card,
-                    borderColor: item.checked ? (isDark ? "#166534" : "#86efac") : cardBorder,
-                    opacity: item.checked ? 0.75 : 1,
-                  }}
-                >
-                  <div className="flex items-center gap-3 px-4 py-3">
-                    <button
-                      onClick={() => toggleCheck(item.productId)}
-                      className="w-7 h-7 rounded-full border-2 flex items-center justify-center flex-shrink-0 transition-all"
-                      style={{
-                        background: item.checked ? "#16a34a" : "transparent",
-                        borderColor: item.checked ? "#16a34a" : cardBorder,
-                      }}
-                    >
-                      {item.checked && <Check size={13} className="text-white" />}
-                    </button>
-                    <span className="text-xl">{item.emoji}</span>
-                    <div className="flex-1">
-                      <p className="font-semibold text-sm" style={{ color: text, textDecoration: item.checked ? "line-through" : "none" }}>{item.productName}</p>
-                      <p className="text-xs" style={{ color: textMuted }}>Est. cost: ₱{item.estimatedCost.toFixed(2)}</p>
+              {restockList.map(item => (
+                <div key={item.id} className="rounded-2xl border mb-3 overflow-hidden" style={{ background: card, borderColor: cardBorder }}>
+                  <div className="px-4 py-3">
+                    <div className="flex items-center gap-3 mb-2">
+                      <button
+                        onClick={() => void handleToggleChecked(item.id, !item.checked, item.editedQty)}
+                        className="w-7 h-7 rounded-full border-2 flex items-center justify-center"
+                        style={{ background: item.checked ? "#16a34a" : "transparent", borderColor: item.checked ? "#16a34a" : cardBorder }}
+                      >
+                        {item.checked && <Check size={12} className="text-white" />}
+                      </button>
+                      <span className="text-xl">{item.emoji}</span>
+                      <div className="flex-1">
+                        <p className="font-semibold text-sm" style={{ color: text }}>{item.productName}</p>
+                        <p className="text-xs" style={{ color: textMuted }}>Suggested: {item.suggestedQty} {item.unit}</p>
+                      </div>
+                      <button onClick={() => void removeRestockItem(item.id)} className="w-7 h-7 rounded-lg flex items-center justify-center" style={{ background: isDark ? "#7f1d1d" : "#fee2e2" }}>
+                        <Trash2 size={13} style={{ color: "#ef4444" }} />
+                      </button>
                     </div>
-                    <div className="text-right flex-shrink-0">
-                      {!item.checked ? (
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            onClick={() => updateQty(item.productId, Math.max(1, item.editedQty - 1))}
-                            className="w-6 h-6 rounded-lg flex items-center justify-center"
-                            style={{ background: isDark ? "#374151" : "#f3f4f6" }}
-                          >
-                            <span style={{ color: textMuted, fontSize: "12px", fontWeight: 700 }}>−</span>
-                          </button>
-                          <span className="font-bold text-sm w-6 text-center" style={{ color: text }}>{item.editedQty}</span>
-                          <button
-                            onClick={() => updateQty(item.productId, item.editedQty + 1)}
-                            className="w-6 h-6 rounded-lg flex items-center justify-center"
-                            style={{ background: "#2563eb" }}
-                          >
-                            <span className="text-white font-bold" style={{ fontSize: "12px" }}>+</span>
-                          </button>
-                        </div>
-                      ) : (
-                        <span className="text-xs font-bold text-green-500">+{item.editedQty} stocked</span>
-                      )}
+                    <div className="grid grid-cols-2 gap-2 mb-2">
+                      <div className="rounded-xl p-2" style={{ background: isDark ? "#374151" : "#f9fafb" }}>
+                        <p className="text-[10px]" style={{ color: textMuted }}>Editable Qty</p>
+                        <input
+                          type="number"
+                          min={0}
+                          value={item.editedQty}
+                          onChange={e => void updateRestockItem(item.id, { editedQty: Math.max(0, Number(e.target.value || 0)) })}
+                          className="w-full mt-1 text-sm font-bold bg-transparent outline-none"
+                          style={{ color: text }}
+                        />
+                      </div>
+                      <div className="rounded-xl p-2" style={{ background: isDark ? "#374151" : "#f9fafb" }}>
+                        <p className="text-[10px]" style={{ color: textMuted }}>Est. Unit Cost</p>
+                        <p className="text-sm font-bold" style={{ color: item.estimatedUnitCost > 0 ? text : "#ef4444" }}>
+                          ₱{item.estimatedUnitCost.toFixed(2)}
+                        </p>
+                      </div>
                     </div>
+                    <p className="text-xs" style={{ color: textMuted }}>
+                      Est. Total: <span style={{ color: text, fontWeight: 700 }}>₱{item.estimatedCost.toFixed(2)}</span>
+                    </p>
                   </div>
                 </div>
               ))}
 
-              {/* Total Budget */}
-              <div className="rounded-2xl border p-4 mt-2 mb-4" style={{ background: card, borderColor: cardBorder }}>
-                <div className="flex justify-between items-center">
-                  <span className="text-sm font-medium" style={{ color: textMuted }}>{t.totalBudget}</span>
-                  <span className="font-black text-xl" style={{ color: text }}>₱{totalBudget.toFixed(2)}</span>
+              <div className="rounded-2xl border p-4 mb-3" style={{ background: card, borderColor: cardBorder }}>
+                <p className="text-sm font-semibold mb-2" style={{ color: text }}>Add Product Manually</p>
+                <div className="flex gap-2 mb-2">
+                  <select value={manualProductId} onChange={e => setManualProductId(e.target.value)} className="flex-1 rounded-xl px-2 py-2 text-sm" style={{ background: isDark ? "#374151" : "#f3f4f6", color: text }}>
+                    <option value="">Select product</option>
+                    {products.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                  </select>
+                  <input type="number" min={1} value={manualQty} onChange={e => setManualQty(Math.max(1, Number(e.target.value || 1)))} className="w-20 rounded-xl px-2 py-2 text-sm" style={{ background: isDark ? "#374151" : "#f3f4f6", color: text }} />
+                  <button
+                    onClick={() => {
+                      if (!manualProduct) return;
+                      void (async () => {
+                        await ensureRestockList();
+                        await addProductToRestockList(manualProduct.id, manualQty, manualProduct.unit);
+                        await calculateRestockBudget();
+                      })();
+                    }}
+                    className="rounded-xl px-3 py-2 text-sm font-bold text-white"
+                    style={{ background: "#2563eb" }}
+                  >
+                    <Plus size={14} />
+                  </button>
                 </div>
-                <p className="text-xs mt-1" style={{ color: textMuted }}>
-                  {shoppingList.filter(i => i.checked).length}/{shoppingList.length} items purchased
-                </p>
               </div>
 
-              {/* Supplier order */}
-              <div className="rounded-2xl border p-4 mb-4" style={{ background: card, borderColor: cardBorder }}>
-                <div className="flex items-center justify-between mb-3">
-                  <div>
-                    <p className="text-sm font-semibold" style={{ color: text }}>Send to supplier</p>
-                    <p className="text-xs" style={{ color: textMuted }}>{suppliers[0]?.storeName || "No supplier available"}</p>
-                  </div>
-                  <span className="text-xs font-bold px-2 py-1 rounded-full" style={{ background: isDark ? "#111827" : "#eef2ff", color: "#1d4ed8" }}>
-                    Premium
-                  </span>
-                </div>
-                <button
-                  onClick={handleSendOrder}
-                  disabled={!suppliers.length || shoppingList.length === 0}
-                  className="w-full py-2.5 rounded-xl text-sm font-bold transition-all disabled:opacity-60"
-                  style={{ background: "#1d4ed8", color: "#fff" }}
+              <div className="rounded-2xl border p-4 mb-3" style={{ background: card, borderColor: cardBorder }}>
+                <p className="text-sm font-semibold mb-2" style={{ color: text }}>Supplier</p>
+                <select
+                  value={activeRestockSupplierId || ""}
+                  onChange={e => e.target.value && void assignSupplierToRestockList(e.target.value)}
+                  className="w-full rounded-xl px-3 py-2 text-sm mb-2"
+                  style={{ background: isDark ? "#374151" : "#f3f4f6", color: text }}
                 >
-                  Send restock request
-                </button>
-                {recentOrder && (
-                  <p className="text-xs mt-2" style={{ color: textMuted }}>
-                    Last order: {recentOrder.status} · {new Date(recentOrder.timestamp).toLocaleTimeString()}
+                  <option value="">Choose supplier</option>
+                  {suppliers.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                </select>
+                <div className="grid grid-cols-1 gap-2">
+                  <input value={supplierName} onChange={e => setSupplierName(e.target.value)} placeholder="Supplier name" className="rounded-xl px-3 py-2 text-sm" style={{ background: isDark ? "#374151" : "#f3f4f6", color: text }} />
+                  <input value={supplierLocation} onChange={e => setSupplierLocation(e.target.value)} placeholder="Location (optional)" className="rounded-xl px-3 py-2 text-sm" style={{ background: isDark ? "#374151" : "#f3f4f6", color: text }} />
+                  <input value={supplierContact} onChange={e => setSupplierContact(e.target.value)} placeholder="Contact (optional)" className="rounded-xl px-3 py-2 text-sm" style={{ background: isDark ? "#374151" : "#f3f4f6", color: text }} />
+                  <button
+                    onClick={() => {
+                      if (!supplierName.trim()) return;
+                      void createSupplier({ name: supplierName, location: supplierLocation, contactNumber: supplierContact });
+                      setSupplierName("");
+                      setSupplierLocation("");
+                      setSupplierContact("");
+                    }}
+                    className="w-full py-2 rounded-xl text-sm font-bold text-white"
+                    style={{ background: "#16a34a" }}
+                  >
+                    Add Supplier
+                  </button>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border p-4 mb-3" style={{ background: card, borderColor: cardBorder }}>
+                <p className="text-sm font-semibold" style={{ color: text }}>Budget Summary</p>
+                <p className="text-xl font-black mt-1" style={{ color: text }}>₱{estimatedTotal.toFixed(2)}</p>
+                {missingPriceCount > 0 && (
+                  <p className="text-xs mt-1 flex items-center gap-1" style={{ color: "#ef4444" }}>
+                    <AlertTriangle size={12} /> {missingPriceCount} item(s) missing supplier or history price
                   </p>
                 )}
               </div>
 
-              {/* Export Options */}
-              <div className="rounded-2xl border overflow-hidden mb-4" style={{ background: card, borderColor: cardBorder }}>
-                <div className="px-4 py-3" style={{ borderBottom: `1px solid ${cardBorder}` }}>
-                  <p className="text-sm font-semibold" style={{ color: text }}>{t.exportList}</p>
+              <div
+                className="rounded-2xl border p-4 mb-4"
+                style={{
+                  background: card,
+                  borderColor: cardBorder,
+                  transform: isConfirmCardZoomed ? "scale(1.02)" : "scale(1)",
+                  transformOrigin: "center",
+                  transition: "transform 220ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 220ms ease",
+                  boxShadow: isConfirmCardZoomed
+                    ? (isDark ? "0 12px 28px rgba(0,0,0,0.35)" : "0 12px 28px rgba(22,163,74,0.2)")
+                    : "none",
+                }}
+              >
+                <p className="text-sm font-semibold mb-2" style={{ color: text }}>Confirmation (Checked Items)</p>
+                <div className="rounded-xl p-2 mb-2" style={{ background: isDark ? "#111827" : "#f8fafc" }}>
+                  <p className="text-[11px] font-semibold mb-2" style={{ color: textMuted }}>On-screen Flow</p>
+                  <div className="grid grid-cols-3 gap-2">
+                    {[
+                      { key: 1, label: "Prepare" },
+                      { key: 2, label: "Review" },
+                      { key: 3, label: "Confirm" },
+                    ].map(step => (
+                      <div
+                        key={step.key}
+                        className="rounded-lg px-2 py-1.5 text-center"
+                        style={{
+                          background: confirmationStep >= step.key
+                            ? (isDark ? "#14532d" : "#dcfce7")
+                            : (isDark ? "#1f2937" : "#e5e7eb"),
+                          color: confirmationStep >= step.key ? "#16a34a" : textMuted,
+                          fontWeight: 700,
+                          fontSize: "11px",
+                        }}
+                      >
+                        {step.label}
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-[11px] mt-2" style={{ color: textMuted }}>
+                    {confirmationStep === 1
+                      ? "Step 1: Set purchased quantity and actual cost for checked products."
+                      : confirmationStep === 2
+                      ? "Step 2: Review all checked products before final confirm."
+                      : "Step 3: Restock confirmed and inventory updated."}
+                  </p>
                 </div>
-                <div className="grid grid-cols-3 gap-0">
-                  {[
-                    { icon: MessageSquare, label: "SMS", color: "#16a34a" },
-                    { icon: Share2, label: "Share", color: "#2563eb" },
-                    { icon: Printer, label: "Print", color: "#7c3aed" },
-                  ].map(({ icon: Icon, label, color }) => (
-                    <button key={label} className="flex flex-col items-center justify-center py-4 gap-1.5" style={{ borderRight: label !== "Print" ? `1px solid ${cardBorder}` : "none" }}>
-                      <Icon size={20} style={{ color }} />
-                      <span className="text-xs font-semibold" style={{ color: textMuted }}>{label}</span>
-                    </button>
-                  ))}
-                </div>
+                {checkedItems.length === 0 ? (
+                  <p className="text-xs" style={{ color: textMuted }}>Check purchased items first.</p>
+                ) : (
+                  <>
+                    {!isReviewingCheckedItems ? (
+                      <>
+                        {checkedItems.map(item => (
+                          <div key={item.id} className="rounded-xl p-2 mb-2" style={{ background: isDark ? "#374151" : "#f9fafb" }}>
+                            <p className="text-xs font-semibold" style={{ color: text }}>{item.productName}</p>
+                            <div className="grid grid-cols-2 gap-2 mt-1">
+                              <div>
+                                <p className="text-[10px] mb-1" style={{ color: textMuted }}>Purchased Qty</p>
+                                <input
+                                  type="number"
+                                  min={0}
+                                  value={confirmDrafts[item.id]?.purchasedQty ?? item.editedQty}
+                                  onChange={e => {
+                                    setIsReviewingCheckedItems(false);
+                                    setConfirmDrafts(prev => ({ ...prev, [item.id]: { ...(prev[item.id] || { actualUnitCost: 0 }), purchasedQty: Math.max(0, Number(e.target.value || 0)) } }));
+                                  }}
+                                  className="w-full rounded-lg px-2 py-1 text-sm"
+                                  style={{ background: isDark ? "#1f2937" : "#ffffff", color: text }}
+                                />
+                              </div>
+                              <div>
+                                <p className="text-[10px] mb-1" style={{ color: textMuted }}>Actual Unit Cost</p>
+                                <input
+                                  type="number"
+                                  min={0}
+                                  step="0.01"
+                                  value={confirmDrafts[item.id]?.actualUnitCost ?? item.estimatedUnitCost}
+                                  onChange={e => {
+                                    setIsReviewingCheckedItems(false);
+                                    setConfirmDrafts(prev => ({ ...prev, [item.id]: { ...(prev[item.id] || { purchasedQty: item.editedQty }), actualUnitCost: Math.max(0, Number(e.target.value || 0)) } }));
+                                  }}
+                                  className="w-full rounded-lg px-2 py-1 text-sm"
+                                  style={{ background: isDark ? "#1f2937" : "#ffffff", color: text }}
+                                />
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                        <button
+                          onClick={handleReviewCheckedItems}
+                          className="w-full py-2.5 rounded-xl text-sm font-bold text-white mt-1"
+                          style={{ background: "#2563eb" }}
+                        >
+                          Review Checked Items
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        {checkedItems.map(item => {
+                          const data = reviewPayload[item.id];
+                          const itemTotal = (data?.purchasedQty || 0) * (data?.actualUnitCost || 0);
+                          return (
+                            <div key={item.id} className="rounded-xl p-2 mb-2" style={{ background: isDark ? "#374151" : "#f9fafb" }}>
+                              <p className="text-xs font-semibold" style={{ color: text }}>{item.productName}</p>
+                              <p className="text-xs mt-1" style={{ color: textMuted }}>
+                                Qty: {data?.purchasedQty || 0} {item.unit} · Unit Cost: ₱{(data?.actualUnitCost || 0).toFixed(2)}
+                              </p>
+                              <p className="text-xs font-bold mt-1" style={{ color: text }}>Item Total: ₱{itemTotal.toFixed(2)}</p>
+                            </div>
+                          );
+                        })}
+                        <div className="rounded-xl p-2 mb-2" style={{ background: isDark ? "#111827" : "#ecfdf5" }}>
+                          <p className="text-xs font-semibold" style={{ color: text }}>Review Total: ₱{reviewTotal.toFixed(2)}</p>
+                        </div>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => setIsReviewingCheckedItems(false)}
+                            className="flex-1 py-2.5 rounded-xl text-sm font-bold"
+                            style={{ background: isDark ? "#374151" : "#f3f4f6", color: text }}
+                          >
+                            Back
+                          </button>
+                          <button
+                            onClick={() => void handleConfirmRestock()}
+                            disabled={isConfirming}
+                            className="flex-1 py-2.5 rounded-xl text-sm font-bold text-white"
+                            style={{ background: "#16a34a", opacity: isConfirming ? 0.7 : 1 }}
+                          >
+                            {isConfirming ? "Confirming..." : "Confirm Restock"}
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </>
+                )}
               </div>
             </>
           )}
